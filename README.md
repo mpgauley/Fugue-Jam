@@ -24,7 +24,8 @@ the user's application data directory.
   to static playlists
 - Customize queue rows to show common audio tags such as artist, album, genre,
   year, and track/disc number, plus track length
-- Play, pause, stop, previous, and next controls
+- Play, pause, stop, previous, and next controls; a second Stop resets the
+  queue selection to its first track without starting playback
 - Waveform timeline with playback progress and click-to-seek controls
 - Selectable 5-, 8-, 12-, 20-, and 31-band software equalizer with persistent
   settings and bass, treble, and vocal presets that apply immediately during

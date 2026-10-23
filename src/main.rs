@@ -30,7 +30,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
 const EQ_BAND_COUNTS: [usize; 5] = [5, 8, 12, 20, 31];
-const PROGRAM_VERSION: u32 = 11;
+const PROGRAM_VERSION: u32 = 13;
 
 struct EqualizerControls {
     gains: [AtomicU32; 31],
@@ -456,10 +456,12 @@ fn default_queue_display_fields() -> Vec<QueueDisplayField> {
     vec![QueueDisplayField::Title]
 }
 
-fn move_queue_entry_to_front(queue: &mut [QueueEntry], current_index: usize) {
-    if current_index < queue.len() && current_index > 0 {
-        queue[..=current_index].rotate_right(1);
-    }
+fn stopped_queue_restart_target(
+    queue: &[QueueEntry],
+    stopped_index: Option<usize>,
+) -> Option<usize> {
+    stopped_index.filter(|index| *index < queue.len())?;
+    (!queue.is_empty()).then_some(0)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1532,23 +1534,47 @@ impl MusicApp {
     fn stop_button(&mut self) {
         if self.sink.is_some() {
             self.stop_audio();
-            self.status =
-                "Playback stopped. Press Stop again to move this track to the top of the queue."
-                    .to_owned();
+            self.status = "Playback stopped. Press Stop again to restart the queue.".to_owned();
             self.save();
             return;
         }
 
-        let Some(current_index) = self
-            .queue_index
-            .filter(|index| *index < self.data.queue.len())
+        let Some(restart_index) = stopped_queue_restart_target(&self.data.queue, self.queue_index)
         else {
-            self.status = "There is no current track to move to the top of the queue.".to_owned();
+            self.status = "There is no stopped track in the queue.".to_owned();
             return;
         };
-        move_queue_entry_to_front(&mut self.data.queue, current_index);
-        self.queue_index = Some(0);
-        self.status = "Current track moved to the top of the queue.".to_owned();
+        let Some(entry) = self.data.queue.get(restart_index) else {
+            self.status = "There is no track at the start of the queue.".to_owned();
+            return;
+        };
+        let path = entry.path.clone();
+        let title = entry.title.clone();
+        let duration_secs = entry.duration_secs;
+        self.queue_index = Some(restart_index);
+        self.paused = false;
+        self.track_duration = duration_secs.map(Duration::from_secs);
+        self.waveform.clear();
+        self.waveform_track = Some(path.clone());
+        let waveform_unavailable = self.waveform_requests.send(path.clone()).is_err();
+        self.current_title = self
+            .data
+            .tracks
+            .iter()
+            .find(|track| track.path == path)
+            .map(|track| format!("{} — {}", track.display_title(), track.album_artist))
+            .unwrap_or(title);
+        self.status = if waveform_unavailable {
+            format!(
+                "Queue restarted at {}. Playback remains stopped. Waveform generator is unavailable.",
+                self.current_title
+            )
+        } else {
+            format!(
+                "Queue restarted at {}. Playback remains stopped.",
+                self.current_title
+            )
+        };
         self.save();
     }
 
@@ -2975,7 +3001,7 @@ mod tests {
         EQ_BAND_COUNTS, LibraryData, LibraryView, QueueDisplayField, QueueEntry, Track,
         available_library_view, collect_audio_files, decode_artwork, eq_frequencies,
         first_tag_value_from_tags, gallery_items, is_in_scan_scope, is_supported_audio_file,
-        move_queue_entry_to_front, remap_eq_gains, track_group_value,
+        remap_eq_gains, stopped_queue_restart_target, track_group_value,
     };
     use std::{
         fs,
@@ -3223,13 +3249,21 @@ mod tests {
     }
 
     #[test]
-    fn moving_stopped_track_to_queue_top_preserves_order() {
-        let mut queue = ["first", "current", "last"].map(|title| QueueEntry {
+    fn restarting_stopped_queue_selects_first_without_starting_playback() {
+        let queue = ["first", "current", "last"].map(|title| QueueEntry {
             title: title.to_owned(),
             ..QueueEntry::default()
         });
-        move_queue_entry_to_front(&mut queue, 1);
-        assert_eq!(queue.map(|entry| entry.title), ["current", "first", "last"]);
+        assert_eq!(stopped_queue_restart_target(&queue, Some(1)), Some(0));
+        assert_eq!(
+            queue
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "current", "last"]
+        );
+        assert_eq!(stopped_queue_restart_target(&queue, None), None);
+        assert_eq!(stopped_queue_restart_target(&[], Some(0)), None);
     }
 
     #[test]

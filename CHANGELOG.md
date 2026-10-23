@@ -5,6 +5,16 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 13
+
+- Changed the second Stop press to reset the current queue selection to its
+  first track without starting playback.
+
+## Version 12
+
+- Changed the second Stop press to play the first track in the queue without
+  moving the stopped track from its existing queue position.
+
 ## Version 11
 
 - Changed Stop behavior: the first press stops playback but retains the current

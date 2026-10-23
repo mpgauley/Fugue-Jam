@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "fugue-jam"
-version = "11.0.0"
+version = "13.0.0"
 dependencies = [
  "cpal",
  "directories",
