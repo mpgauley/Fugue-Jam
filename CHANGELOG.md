@@ -5,6 +5,14 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 9
+
+- Added a Japanese-capable system font fallback through fontconfig for song
+  names and other interface text.
+- Expanded the Now Playing queue list to fill the available right-side frame
+  vertically and horizontally, with full-width row click/context targets.
+- Removed **Album Artist** from the Library **Display** menu.
+
 ## Version 8
 
 - Reduced each Now Playing queue entry to only its track path and display title,

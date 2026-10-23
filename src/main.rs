@@ -4,6 +4,7 @@ use std::{
     hash::{Hash, Hasher},
     io::BufReader,
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -29,7 +30,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
 const EQ_BAND_COUNTS: [usize; 5] = [5, 8, 12, 20, 31];
-const PROGRAM_VERSION: u32 = 8;
+const PROGRAM_VERSION: u32 = 9;
 
 struct EqualizerControls {
     gains: [AtomicU32; 31],
@@ -487,6 +488,13 @@ fn default_now_playing_left_fraction() -> f32 {
     0.75
 }
 
+fn available_library_view(view: LibraryView) -> LibraryView {
+    match view {
+        LibraryView::AlbumArtist => LibraryView::Tracks,
+        available => available,
+    }
+}
+
 fn supported_eq_band_count(count: usize) -> usize {
     if EQ_BAND_COUNTS.contains(&count) {
         count
@@ -606,6 +614,7 @@ impl MusicApp {
             .iter_mut()
             .for_each(|gain| *gain = gain.clamp(-12.0, 12.0));
         data.now_playing_left_fraction = data.now_playing_left_fraction.clamp(0.25, 0.9);
+        data.library_view = available_library_view(data.library_view);
         let output_device_name = cpal::default_host()
             .default_output_device()
             .and_then(|device| match device.name() {
@@ -1479,11 +1488,6 @@ impl MusicApp {
                 ))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.library_view, LibraryView::Album, "Album");
-                    ui.selectable_value(
-                        &mut self.library_view,
-                        LibraryView::AlbumArtist,
-                        "Album Artist",
-                    );
                     ui.selectable_value(&mut self.library_view, LibraryView::Tracks, "Tracks");
                 });
             egui::ComboBox::from_id_salt("sort_by")
@@ -1971,63 +1975,55 @@ impl MusicApp {
         let mut action = None;
         let mut play_index = None;
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
-        egui::ScrollArea::vertical().max_height(420.0).show_rows(
-            ui,
-            row_height,
-            self.data.queue.len(),
-            |ui, rows| {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, self.data.queue.len(), |ui, rows| {
                 for index in rows {
                     let title = &self.data.queue[index].title;
-                    ui.set_min_height(row_height);
-                    ui.horizontal(|ui| {
-                        let marker = if self.queue_index == Some(index) {
-                            "▶"
-                        } else {
-                            " "
-                        };
-                        let response = ui.add(
-                            egui::Label::new(format!("{marker}  {title}"))
-                                .sense(egui::Sense::click()),
-                        );
-                        if response.clicked() {
-                            play_index = Some(index);
+                    let marker = if self.queue_index == Some(index) {
+                        "▶"
+                    } else {
+                        " "
+                    };
+                    let response = ui.add_sized(
+                        [ui.available_width(), row_height],
+                        egui::Label::new(format!("{marker}  {title}")).sense(egui::Sense::click()),
+                    );
+                    if response.clicked() {
+                        play_index = Some(index);
+                    }
+                    response.context_menu(|ui| {
+                        if ui.button("Remove Track").clicked() {
+                            action = Some((index, QueueAction::Remove));
+                            ui.close_menu();
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Remove Track").clicked() {
-                                action = Some((index, QueueAction::Remove));
+                        if ui.button("Play Track Next").clicked() {
+                            action = Some((index, QueueAction::PlayNext));
+                            ui.close_menu();
+                        }
+                        if ui.button("Move Track to the End").clicked() {
+                            action = Some((index, QueueAction::MoveToEnd));
+                            ui.close_menu();
+                        }
+                        ui.menu_button("Add Track to Playlist…", |ui| {
+                            if ui.button("Create new playlist…").clicked() {
+                                action = Some((index, QueueAction::CreatePlaylist));
                                 ui.close_menu();
                             }
-                            if ui.button("Play Track Next").clicked() {
-                                action = Some((index, QueueAction::PlayNext));
-                                ui.close_menu();
+                            if static_playlists.is_empty() {
+                                ui.label("No static playlists yet");
                             }
-                            if ui.button("Move Track to the End").clicked() {
-                                action = Some((index, QueueAction::MoveToEnd));
-                                ui.close_menu();
-                            }
-                            ui.menu_button("Add Track to Playlist…", |ui| {
-                                if ui.button("Create new playlist…").clicked() {
-                                    action = Some((index, QueueAction::CreatePlaylist));
+                            for (playlist_index, name) in &static_playlists {
+                                if ui.button(name).clicked() {
+                                    action =
+                                        Some((index, QueueAction::AddToPlaylist(*playlist_index)));
                                     ui.close_menu();
                                 }
-                                if static_playlists.is_empty() {
-                                    ui.label("No static playlists yet");
-                                }
-                                for (playlist_index, name) in &static_playlists {
-                                    if ui.button(name).clicked() {
-                                        action = Some((
-                                            index,
-                                            QueueAction::AddToPlaylist(*playlist_index),
-                                        ));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
+                            }
                         });
                     });
                 }
-            },
-        );
+            });
         if let Some(index) = play_index {
             self.play_queue_index(index);
         }
@@ -2701,16 +2697,59 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Fugue Jam",
         options,
-        Box::new(|_creation_context| Ok(Box::new(MusicApp::new()))),
+        Box::new(|creation_context| {
+            if let Err(error) = install_japanese_font_fallback(&creation_context.egui_ctx) {
+                eprintln!(
+                    "Japanese text may not display because a Japanese font could not be loaded: {error}"
+                );
+            }
+            Ok(Box::new(MusicApp::new()))
+        }),
     )
+}
+
+fn install_japanese_font_fallback(ctx: &egui::Context) -> Result<(), String> {
+    let output = Command::new("fc-match")
+        .args(["-f", "%{file}\n%{index}\n", ":lang=ja"])
+        .output()
+        .map_err(|error| format!("fontconfig lookup failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("fontconfig exited with {}", output.status));
+    }
+    let output = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    let mut lines = output.lines();
+    let path = lines
+        .next()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "no Japanese-capable system font was found".to_owned())?;
+    let index = lines
+        .next()
+        .and_then(|index| index.parse::<u32>().ok())
+        .unwrap_or(0);
+    let font = fs::read(path).map_err(|error| format!("could not read {path}: {error}"))?;
+    let mut definitions = egui::FontDefinitions::default();
+    let mut font_data = egui::FontData::from_owned(font);
+    font_data.index = index;
+    definitions
+        .font_data
+        .insert("system-japanese-fallback".to_owned(), font_data.into());
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        definitions
+            .families
+            .entry(family)
+            .or_default()
+            .push("system-japanese-fallback".to_owned());
+    }
+    ctx.set_fonts(definitions);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EQ_BAND_COUNTS, LibraryData, LibraryView, QueueEntry, Track, collect_audio_files,
-        decode_artwork, eq_frequencies, gallery_items, is_in_scan_scope, is_supported_audio_file,
-        remap_eq_gains, track_group_value,
+        EQ_BAND_COUNTS, LibraryData, LibraryView, QueueEntry, Track, available_library_view,
+        collect_audio_files, decode_artwork, eq_frequencies, gallery_items, is_in_scan_scope,
+        is_supported_audio_file, remap_eq_gains, track_group_value,
     };
     use std::{
         fs,
@@ -2903,5 +2942,9 @@ mod tests {
         assert_eq!(restored.eq_bands, vec![1.0; 8]);
         assert!(!restored.eq_enabled);
         assert!((restored.now_playing_left_fraction - 0.6).abs() < f32::EPSILON);
+        assert_eq!(
+            available_library_view(LibraryView::AlbumArtist),
+            LibraryView::Tracks
+        );
     }
 }

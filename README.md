@@ -10,6 +10,8 @@ the user's application data directory.
   album artist, album, genre, or year
 - Background artwork loading and virtualized, vertically scrolling library views
 - Library controls for grouping, display type, sorting, and thumbnail size
+- Uses an installed Japanese-capable system font for Japanese song titles and
+  other supported language glyphs
 - Non-blocking library scanning with progress and recursive subfolder scanning
   enabled by default
 - Right-click selected library tracks to queue them or create/add to a static
@@ -44,7 +46,7 @@ device and its drivers.
 Install Rust and the ALSA development headers. On Debian or Ubuntu:
 
 ```sh
-sudo apt install build-essential pkg-config libasound2-dev
+sudo apt install build-essential pkg-config libasound2-dev fonts-noto-cjk
 ```
 
 Then run:
