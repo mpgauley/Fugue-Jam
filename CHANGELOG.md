@@ -5,6 +5,18 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 4
+
+- Added fixed, always-visible right-side scrollbars to the Library track and
+  gallery views.
+- Changed track-view clicks to select tracks; playback is available through
+  **Play selection** and the track context menu.
+- Added a thumbnail/icon size slider.
+- Replaced the library controls with **Group By**, **Display**, and **Sort By**
+  options for album artist, genre, decade, albums, artists, and tracks.
+- Added group headings to gallery views and inverted selected-card borders.
+- Added right-side spacing to gallery rows so the last cover is not clipped.
+
 ## Version 3
 
 - Moved album artwork decoding and texture loading to a background worker so

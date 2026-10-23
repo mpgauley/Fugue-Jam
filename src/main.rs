@@ -28,7 +28,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
 const EQ_FREQUENCIES: [f32; 5] = [60.0, 250.0, 1_000.0, 4_000.0, 12_000.0];
-const PROGRAM_VERSION: u32 = 3;
+const PROGRAM_VERSION: u32 = 4;
 
 struct Biquad {
     coefficients: [f32; 5],
@@ -230,6 +230,8 @@ struct MusicApp {
     filter: String,
     organize_by: String,
     library_view: LibraryView,
+    sort_by: String,
+    thumbnail_size: f32,
     active_playlist: Option<usize>,
     new_playlist_name: String,
     smart_playlist_name: String,
@@ -273,8 +275,25 @@ enum ScanMessage {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LibraryView {
+    Album,
+    AlbumArtist,
     Tracks,
-    Albums,
+}
+
+#[derive(Clone)]
+struct GalleryItem {
+    label: String,
+    group: String,
+    album_artist: String,
+    album: String,
+    year: Option<u32>,
+    artwork_path: Option<PathBuf>,
+    tracks: Vec<PathBuf>,
+}
+
+enum GalleryRow {
+    Heading(String),
+    Items(Vec<GalleryItem>),
 }
 
 impl MusicApp {
@@ -335,6 +354,8 @@ impl MusicApp {
             filter: String::new(),
             organize_by: "Album Artist".to_owned(),
             library_view: LibraryView::Tracks,
+            sort_by: "Album Name".to_owned(),
+            thumbnail_size: 144.0,
             active_playlist: None,
             new_playlist_name: String::new(),
             smart_playlist_name: String::new(),
@@ -595,6 +616,19 @@ impl MusicApp {
         self.status = format!("Added {count} selected track(s) to the queue.");
     }
 
+    fn play_selected_track(&mut self) {
+        let Some(path) = self.selected_tracks().into_iter().next() else {
+            self.status = "Select a track to play.".to_owned();
+            return;
+        };
+        if !self.queue.contains(&path) {
+            self.queue.push(path.clone());
+        }
+        if let Some(index) = self.queue.iter().position(|queued| queued == &path) {
+            self.play_queue_index(index);
+        }
+    }
+
     fn playlist_tracks(&self, playlist: &Playlist) -> Vec<PathBuf> {
         if let Some((field, query)) = &playlist.smart {
             let needle = query.to_lowercase();
@@ -804,36 +838,51 @@ impl MusicApp {
                 ui.checkbox(&mut self.scan_subfolders, "Scan subfolders");
             });
             ui.label(format!("{} tracks", self.data.tracks.len()));
+        });
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("group_by")
+                .selected_text(format!("Group By: {}", self.organize_by))
+                .show_ui(ui, |ui| {
+                    for mode in ["Album Artist", "Genre", "Decade", "No Grouping"] {
+                        ui.selectable_value(&mut self.organize_by, mode.to_owned(), mode);
+                    }
+                });
+            egui::ComboBox::from_id_salt("display")
+                .selected_text(format!(
+                    "Display: {}",
+                    match self.library_view {
+                        LibraryView::Album => "Album",
+                        LibraryView::AlbumArtist => "Album Artist",
+                        LibraryView::Tracks => "Tracks",
+                    }
+                ))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.library_view, LibraryView::Album, "Album");
+                    ui.selectable_value(
+                        &mut self.library_view,
+                        LibraryView::AlbumArtist,
+                        "Album Artist",
+                    );
+                    ui.selectable_value(&mut self.library_view, LibraryView::Tracks, "Tracks");
+                });
+            egui::ComboBox::from_id_salt("sort_by")
+                .selected_text(format!("Sort By: {}", self.sort_by))
+                .show_ui(ui, |ui| {
+                    for mode in ["Album Name", "Album Artist", "Year"] {
+                        ui.selectable_value(&mut self.sort_by, mode.to_owned(), mode);
+                    }
+                });
+            ui.add(
+                egui::Slider::new(&mut self.thumbnail_size, 72.0..=240.0)
+                    .text("Thumbnail size")
+                    .suffix(" px"),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
                         .hint_text("Search title, artist, album, genre…")
-                        .desired_width(260.0),
+                        .desired_width(220.0),
                 );
-                egui::ComboBox::from_id_salt("library_view")
-                    .selected_text(match self.library_view {
-                        LibraryView::Tracks => "Tracks",
-                        LibraryView::Albums => "Albums",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.library_view,
-                            LibraryView::Tracks,
-                            "Track view",
-                        );
-                        ui.selectable_value(
-                            &mut self.library_view,
-                            LibraryView::Albums,
-                            "Album view",
-                        );
-                    });
-                egui::ComboBox::from_id_salt("organize")
-                    .selected_text(format!("By {}", self.organize_by))
-                    .show_ui(ui, |ui| {
-                        for mode in ["Album Artist", "Album", "Genre", "Year"] {
-                            ui.selectable_value(&mut self.organize_by, mode.to_owned(), mode);
-                        }
-                    });
             });
         });
         ui.horizontal(|ui| {
@@ -842,6 +891,9 @@ impl MusicApp {
             }
             if ui.button("Add selected randomly").clicked() {
                 self.add_selected_to_queue(true);
+            }
+            if ui.button("Play selection").clicked() {
+                self.play_selected_track();
             }
             if ui.button("Select all visible").clicked() {
                 self.selected_paths
@@ -856,7 +908,7 @@ impl MusicApp {
             ui.centered_and_justified(|ui| {
                 ui.label("Your library is empty. Add a folder containing music files.");
             });
-        } else if self.library_view == LibraryView::Albums {
+        } else if self.library_view != LibraryView::Tracks {
             self.render_album_grid(ui, &tracks);
         } else {
             self.render_track_list(ui, &tracks);
@@ -874,146 +926,209 @@ impl MusicApp {
             ui.add_sized([55.0, 20.0], egui::Label::new("Duration"));
         });
         ui.separator();
-        egui::ScrollArea::vertical().show_rows(ui, 64.0, tracks.len(), |ui, row_range| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for index in row_range {
-                let track = &tracks[index];
-                let group = track_group_value(track, &self.organize_by);
-                let is_first_in_group =
-                    index == 0 || group != track_group_value(&tracks[index - 1], &self.organize_by);
-                let group_label = if group.is_empty() { "Unknown" } else { &group };
-                let path = track.path.clone();
-                let texture = self.load_artwork(track.artwork_path.as_deref());
-                let response = ui
-                    .vertical(|ui| {
-                        if is_first_in_group {
-                            ui.add_sized(
-                                [320.0, 16.0],
-                                egui::Label::new(egui::RichText::new(group_label).small()),
-                            );
-                        } else {
-                            ui.add_space(16.0);
-                        }
-                        ui.horizontal(|ui| {
-                            let mut selected = self.selected_paths.contains(&path);
-                            if ui.checkbox(&mut selected, "").changed() {
-                                if selected {
-                                    self.selected_paths.insert(path.clone());
-                                } else {
-                                    self.selected_paths.remove(&path);
-                                }
-                            }
-                            if let Some(texture) = texture {
-                                ui.add(
-                                    egui::Image::from_texture(&texture)
-                                        .fit_to_exact_size(egui::vec2(40.0, 40.0)),
+        let icon_size = (self.thumbnail_size * 0.28).clamp(24.0, 80.0);
+        let row_height = icon_size + 24.0;
+        egui::ScrollArea::vertical()
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show_rows(ui, row_height, tracks.len(), |ui, row_range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for index in row_range {
+                    let track = &tracks[index];
+                    let group = track_group_value(track, &self.organize_by);
+                    let is_first_in_group = self.organize_by != "No Grouping"
+                        && (index == 0
+                            || group != track_group_value(&tracks[index - 1], &self.organize_by));
+                    let group_label = if group.is_empty() { "Unknown" } else { &group };
+                    let path = track.path.clone();
+                    let texture = self.load_artwork(track.artwork_path.as_deref());
+                    let row_response = ui
+                        .vertical(|ui| {
+                            if is_first_in_group {
+                                ui.add_sized(
+                                    [320.0, 16.0],
+                                    egui::Label::new(egui::RichText::new(group_label).small()),
                                 );
                             } else {
-                                ui.add_sized([40.0, 40.0], egui::Label::new("♫"));
+                                ui.add_space(16.0);
                             }
-                            if ui
-                                .add_sized(
-                                    [210.0, 40.0],
-                                    egui::Button::new(track.display_title()).frame(false),
-                                )
-                                .clicked()
-                            {
-                                if !self.queue.contains(&path) {
-                                    self.queue.push(path.clone());
-                                }
-                                if let Some(index) =
-                                    self.queue.iter().position(|item| item == &path)
-                                {
-                                    self.play_queue_index(index);
-                                }
-                            }
-                            ui.add_sized([140.0, 40.0], egui::Label::new(&track.album_artist));
-                            ui.add_sized([150.0, 40.0], egui::Label::new(&track.album));
-                            ui.add_sized(
-                                [48.0, 40.0],
-                                egui::Label::new(
-                                    track.year.map(|year| year.to_string()).unwrap_or_default(),
-                                ),
-                            );
-                            ui.add_sized([58.0, 40.0], egui::Label::new(track.file_type()));
-                            ui.add_sized([55.0, 40.0], egui::Label::new(track.duration_label()));
-                        })
-                        .response
-                    })
-                    .response;
-                self.show_track_context_menu(&response, std::slice::from_ref(&path));
-            }
-        });
-    }
-
-    fn render_album_grid(&mut self, ui: &mut egui::Ui, tracks: &[Track]) {
-        let mut albums = std::collections::BTreeMap::<(String, String), Vec<&Track>>::new();
-        for track in tracks {
-            albums
-                .entry((track.album_artist.clone(), track.album.clone()))
-                .or_default()
-                .push(track);
-        }
-        let albums: Vec<_> = albums.into_iter().collect();
-        let columns = ((ui.available_width() / 168.0).floor() as usize).max(1);
-        let rows = albums.len().div_ceil(columns);
-        egui::ScrollArea::vertical().show_rows(ui, 168.0, rows, |ui, row_range| {
-            for row in row_range {
-                ui.horizontal(|ui| {
-                    for column in 0..columns {
-                        let index = row * columns + column;
-                        let Some(((artist, album), album_tracks)) = albums.get(index) else {
-                            break;
-                        };
-                        let Some(representative) = album_tracks.first() else {
-                            continue;
-                        };
-                        let artwork = representative.artwork_path.clone();
-                        let paths: Vec<PathBuf> = album_tracks
-                            .iter()
-                            .map(|track| track.path.clone())
-                            .collect();
-                        let texture = self.load_artwork(artwork.as_deref());
-                        let artwork_failed = artwork
-                            .as_ref()
-                            .is_some_and(|path| self.artwork_failed.contains(path));
-                        let card = egui::Frame::group(ui.style())
-                            .show(ui, |ui| {
-                                ui.set_min_size(egui::vec2(152.0, 152.0));
-                                ui.set_max_size(egui::vec2(152.0, 152.0));
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
                                 if let Some(texture) = texture {
                                     ui.add(
                                         egui::Image::from_texture(&texture)
-                                            .fit_to_exact_size(egui::vec2(144.0, 144.0)),
+                                            .fit_to_exact_size(egui::vec2(icon_size, icon_size)),
                                     );
-                                } else if artwork.is_some() && !artwork_failed {
-                                    ui.centered_and_justified(|ui| {
-                                        ui.label("…");
-                                    });
                                 } else {
-                                    ui.centered_and_justified(|ui| {
-                                        ui.label(if album.is_empty() {
-                                            "Unknown album"
-                                        } else {
-                                            album
-                                        });
-                                    });
+                                    ui.add_sized([icon_size, icon_size], egui::Label::new("♫"));
                                 }
+                                ui.add_sized(
+                                    [210.0, icon_size],
+                                    egui::Label::new(track.display_title()),
+                                );
+                                ui.add_sized(
+                                    [140.0, icon_size],
+                                    egui::Label::new(&track.album_artist),
+                                );
+                                ui.add_sized([150.0, icon_size], egui::Label::new(&track.album));
+                                ui.add_sized(
+                                    [48.0, icon_size],
+                                    egui::Label::new(
+                                        track.year.map(|year| year.to_string()).unwrap_or_default(),
+                                    ),
+                                );
+                                ui.add_sized(
+                                    [58.0, icon_size],
+                                    egui::Label::new(track.file_type()),
+                                );
+                                ui.add_sized(
+                                    [55.0, icon_size],
+                                    egui::Label::new(track.duration_label()),
+                                );
                             })
-                            .response;
-                        let card = ui.interact(
-                            card.rect,
-                            ui.id().with(("album", artist, album)),
-                            egui::Sense::click(),
-                        );
-                        if card.clicked() {
-                            self.selected_paths.extend(paths.iter().cloned());
+                            .response
+                        })
+                        .response;
+                    let response = ui.interact(
+                        row_response.rect,
+                        ui.id().with(("track-row", &path)),
+                        egui::Sense::click(),
+                    );
+                    if response.clicked() {
+                        if !self.selected_paths.remove(&path) {
+                            self.selected_paths.insert(path.clone());
                         }
-                        self.show_track_context_menu(&card, &paths);
                     }
-                });
+                    self.show_track_context_menu(&response, std::slice::from_ref(&path));
+                }
+            });
+    }
+
+    fn render_album_grid(&mut self, ui: &mut egui::Ui, tracks: &[Track]) {
+        let items = gallery_items(tracks, self.library_view, &self.organize_by, &self.sort_by);
+        let mut grouped = std::collections::BTreeMap::<String, Vec<GalleryItem>>::new();
+        for item in items {
+            let group = if self.organize_by == "No Grouping" {
+                String::new()
+            } else {
+                item.group.clone()
+            };
+            grouped.entry(group).or_default().push(item);
+        }
+
+        let columns = ((ui.available_width() - ui.spacing().scroll.bar_width - 10.0)
+            / (self.thumbnail_size + 24.0))
+            .floor()
+            .max(1.0) as usize;
+        let mut rows = Vec::new();
+        for (group, items) in grouped {
+            if !group.is_empty() {
+                rows.push(GalleryRow::Heading(group));
             }
-        });
+            for chunk in items.chunks(columns) {
+                rows.push(GalleryRow::Items(chunk.to_vec()));
+            }
+        }
+        egui::ScrollArea::vertical()
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show_rows(
+                ui,
+                self.thumbnail_size + 32.0,
+                rows.len(),
+                |ui, row_range| {
+                    for row_index in row_range {
+                        match &rows[row_index] {
+                            GalleryRow::Heading(group) => {
+                                ui.vertical(|ui| {
+                                    ui.heading(group);
+                                    ui.add_space((self.thumbnail_size - 16.0).max(0.0));
+                                });
+                            }
+                            GalleryRow::Items(items) => {
+                                ui.horizontal(|ui| {
+                                    for item in items {
+                                        let size = self.thumbnail_size;
+                                        let selected = item
+                                            .tracks
+                                            .iter()
+                                            .any(|path| self.selected_paths.contains(path));
+                                        let texture =
+                                            self.load_artwork(item.artwork_path.as_deref());
+                                        let artwork_failed = item
+                                            .artwork_path
+                                            .as_ref()
+                                            .is_some_and(|path| self.artwork_failed.contains(path));
+                                        let stroke = if selected {
+                                            egui::Stroke::new(
+                                                2.0_f32,
+                                                inverted_color(
+                                                    ui.visuals().widgets.noninteractive.bg_fill,
+                                                ),
+                                            )
+                                        } else {
+                                            ui.visuals().widgets.noninteractive.bg_stroke
+                                        };
+                                        let card = egui::Frame::group(ui.style())
+                                            .stroke(stroke)
+                                            .show(ui, |ui| {
+                                                ui.set_min_size(egui::vec2(size, size));
+                                                ui.set_max_size(egui::vec2(size, size));
+                                                if let Some(texture) = texture {
+                                                    ui.add(
+                                                        egui::Image::from_texture(&texture)
+                                                            .fit_to_exact_size(egui::vec2(
+                                                                size, size,
+                                                            )),
+                                                    );
+                                                } else if item.artwork_path.is_some()
+                                                    && !artwork_failed
+                                                {
+                                                    ui.centered_and_justified(|ui| {
+                                                        ui.label("…");
+                                                    });
+                                                } else {
+                                                    ui.centered_and_justified(|ui| {
+                                                        ui.label(if item.label.is_empty() {
+                                                            "Unknown"
+                                                        } else {
+                                                            &item.label
+                                                        });
+                                                    });
+                                                }
+                                                ui.add_space((self.thumbnail_size - size).max(0.0));
+                                            })
+                                            .response;
+                                        let card = ui.interact(
+                                            card.rect,
+                                            ui.id().with((
+                                                "library-card",
+                                                &item.label,
+                                                &item.tracks,
+                                            )),
+                                            egui::Sense::click(),
+                                        );
+                                        if card.clicked() {
+                                            let all_selected = item
+                                                .tracks
+                                                .iter()
+                                                .all(|path| self.selected_paths.contains(path));
+                                            if all_selected {
+                                                for path in &item.tracks {
+                                                    self.selected_paths.remove(path);
+                                                }
+                                            } else {
+                                                self.selected_paths
+                                                    .extend(item.tracks.iter().cloned());
+                                            }
+                                        }
+                                        self.show_track_context_menu(&card, &item.tracks);
+                                    }
+                                    ui.add_space(10.0);
+                                });
+                            }
+                        }
+                    }
+                },
+            );
     }
 
     fn show_track_context_menu(&mut self, response: &egui::Response, paths: &[PathBuf]) {
@@ -1023,6 +1138,10 @@ impl MusicApp {
             self.selected_paths.extend(paths.iter().cloned());
         }
         response.context_menu(|ui| {
+            if ui.button("Play selection").clicked() {
+                self.play_selected_track();
+                ui.close_menu();
+            }
             if ui.button("Add selection to queue").clicked() {
                 self.add_selected_to_queue(false);
                 ui.close_menu();
@@ -1078,6 +1197,7 @@ impl MusicApp {
         tracks.sort_by_cached_key(|track| {
             (
                 track_group_value(track, &self.organize_by).to_lowercase(),
+                track_sort_value(track, &self.sort_by),
                 track.display_title().to_lowercase(),
             )
         });
@@ -1455,11 +1575,98 @@ fn format_duration(duration: Duration) -> String {
 
 fn track_group_value(track: &Track, organize_by: &str) -> String {
     match organize_by {
-        "Album" => track.album.clone(),
         "Genre" => track.genre.clone(),
-        "Year" => track.year.map(|year| year.to_string()).unwrap_or_default(),
+        "Decade" => track
+            .year
+            .map(|year| format!("{}s", year / 10 * 10))
+            .unwrap_or_else(|| "Unknown decade".to_owned()),
+        "No Grouping" => String::new(),
         _ => track.album_artist.clone(),
     }
+}
+
+fn track_sort_value(track: &Track, sort_by: &str) -> (String, u32) {
+    match sort_by {
+        "Album Artist" => (track.album_artist.to_lowercase(), 0),
+        "Year" => (String::new(), track.year.unwrap_or(u32::MAX)),
+        _ => (track.album.to_lowercase(), 0),
+    }
+}
+
+fn inverted_color(color: egui::Color32) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        255 - color.r(),
+        255 - color.g(),
+        255 - color.b(),
+        color.a(),
+    )
+}
+
+fn gallery_items(
+    tracks: &[Track],
+    display: LibraryView,
+    group_by: &str,
+    sort_by: &str,
+) -> Vec<GalleryItem> {
+    let mut entries = std::collections::BTreeMap::<String, Vec<&Track>>::new();
+    for track in tracks {
+        let key = match display {
+            LibraryView::Album => format!("{}\0{}", track.album_artist, track.album),
+            LibraryView::AlbumArtist => track.album_artist.clone(),
+            LibraryView::Tracks => continue,
+        };
+        entries.entry(key).or_default().push(track);
+    }
+
+    let mut items: Vec<GalleryItem> = entries
+        .into_values()
+        .filter_map(|album_tracks| {
+            let representative = *album_tracks.first()?;
+            let label = match display {
+                LibraryView::Album => representative.album.clone(),
+                LibraryView::AlbumArtist => representative.album_artist.clone(),
+                LibraryView::Tracks => return None,
+            };
+            let group = match group_by {
+                "Genre" => {
+                    if representative.genre.is_empty() {
+                        "Unknown genre".to_owned()
+                    } else {
+                        representative.genre.clone()
+                    }
+                }
+                "Decade" => track_group_value(representative, "Decade"),
+                "No Grouping" => String::new(),
+                _ => {
+                    if representative.album_artist.is_empty() {
+                        "Unknown artist".to_owned()
+                    } else {
+                        representative.album_artist.clone()
+                    }
+                }
+            };
+            Some(GalleryItem {
+                label,
+                group,
+                album_artist: representative.album_artist.clone(),
+                album: representative.album.clone(),
+                year: representative.year,
+                artwork_path: album_tracks
+                    .iter()
+                    .find_map(|track| track.artwork_path.clone()),
+                tracks: album_tracks
+                    .iter()
+                    .map(|track| track.path.clone())
+                    .collect(),
+            })
+        })
+        .collect();
+    items.sort_by_cached_key(|item| match sort_by {
+        "Album Artist" => (item.album_artist.to_lowercase(), String::new(), 0),
+        "Year" => (String::new(), String::new(), item.year.unwrap_or(u32::MAX)),
+        _ => (item.album.to_lowercase(), String::new(), 0),
+    });
+    items
 }
 
 fn collect_audio_files(
@@ -1596,7 +1803,10 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_audio_files, decode_artwork, is_supported_audio_file};
+    use super::{
+        LibraryView, Track, collect_audio_files, decode_artwork, gallery_items,
+        is_supported_audio_file, track_group_value,
+    };
     use std::{
         fs,
         path::Path,
@@ -1655,5 +1865,51 @@ mod tests {
 
         fs::remove_dir_all(path.parent().expect("artwork test parent"))
             .expect("remove artwork test folder");
+    }
+
+    #[test]
+    fn decade_grouping_and_gallery_modes_use_expected_items() {
+        let tracks = vec![
+            Track {
+                path: Path::new("music/a.flac").to_path_buf(),
+                title: "A".to_owned(),
+                album_artist: "Artist".to_owned(),
+                album: "First".to_owned(),
+                year: Some(1987),
+                ..Track::default()
+            },
+            Track {
+                path: Path::new("music/b.flac").to_path_buf(),
+                title: "B".to_owned(),
+                album_artist: "Artist".to_owned(),
+                album: "First".to_owned(),
+                year: Some(1988),
+                ..Track::default()
+            },
+            Track {
+                path: Path::new("music/c.flac").to_path_buf(),
+                title: "C".to_owned(),
+                album_artist: "Artist".to_owned(),
+                album: "Second".to_owned(),
+                year: Some(1992),
+                ..Track::default()
+            },
+        ];
+
+        assert_eq!(track_group_value(&tracks[0], "Decade"), "1980s");
+        assert_eq!(
+            gallery_items(&tracks, LibraryView::Album, "Decade", "Album Name").len(),
+            2
+        );
+        assert_eq!(
+            gallery_items(
+                &tracks,
+                LibraryView::AlbumArtist,
+                "No Grouping",
+                "Album Artist"
+            )
+            .len(),
+            1
+        );
     }
 }
