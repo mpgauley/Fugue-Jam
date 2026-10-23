@@ -23,7 +23,7 @@ the user's application data directory.
 - Queue context actions for removing, reordering, playing next, and adding tracks
   to static playlists
 - Customize queue rows to show common audio tags such as artist, album, genre,
-  year, track/disc number, composer, and BPM
+  year, and track/disc number, plus track length
 - Play, pause, stop, previous, and next controls
 - Waveform timeline with playback progress and click-to-seek controls
 - Selectable 5-, 8-, 12-, 20-, and 31-band software equalizer with persistent

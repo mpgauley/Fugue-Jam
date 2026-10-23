@@ -30,7 +30,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
 const EQ_BAND_COUNTS: [usize; 5] = [5, 8, 12, 20, 31];
-const PROGRAM_VERSION: u32 = 10;
+const PROGRAM_VERSION: u32 = 11;
 
 struct EqualizerControls {
     gains: [AtomicU32; 31],
@@ -264,10 +264,6 @@ struct Track {
     track_number: Option<String>,
     #[serde(default)]
     disc_number: Option<String>,
-    #[serde(default)]
-    composer: String,
-    #[serde(default)]
-    bpm: Option<String>,
     duration_secs: Option<u64>,
     #[serde(default)]
     artwork_path: Option<PathBuf>,
@@ -338,8 +334,7 @@ struct QueueEntry {
     year: Option<u32>,
     track_number: Option<String>,
     disc_number: Option<String>,
-    composer: String,
-    bpm: Option<String>,
+    duration_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -388,8 +383,7 @@ impl QueueEntry {
             year: track.year,
             track_number: track.track_number.clone(),
             disc_number: track.disc_number.clone(),
-            composer: track.composer.clone(),
-            bpm: track.bpm.clone(),
+            duration_secs: track.duration_secs,
         }
     }
 
@@ -403,8 +397,10 @@ impl QueueEntry {
             QueueDisplayField::Year => self.year.map(|year| year.to_string()),
             QueueDisplayField::TrackNumber => self.track_number.clone(),
             QueueDisplayField::DiscNumber => self.disc_number.clone(),
-            QueueDisplayField::Composer => Some(self.composer.clone()),
-            QueueDisplayField::Bpm => self.bpm.clone(),
+            QueueDisplayField::TrackLength => self
+                .duration_secs
+                .map(|secs| format_duration(Duration::from_secs(secs))),
+            QueueDisplayField::Composer | QueueDisplayField::Bpm => None,
         }?;
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_owned())
@@ -421,12 +417,13 @@ enum QueueDisplayField {
     Year,
     TrackNumber,
     DiscNumber,
+    TrackLength,
     Composer,
     Bpm,
 }
 
 impl QueueDisplayField {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 9] = [
         Self::Title,
         Self::Artist,
         Self::AlbumArtist,
@@ -435,8 +432,7 @@ impl QueueDisplayField {
         Self::Year,
         Self::TrackNumber,
         Self::DiscNumber,
-        Self::Composer,
-        Self::Bpm,
+        Self::TrackLength,
     ];
 
     fn label(self) -> &'static str {
@@ -449,6 +445,7 @@ impl QueueDisplayField {
             Self::Year => "Year",
             Self::TrackNumber => "Track number",
             Self::DiscNumber => "Disc number",
+            Self::TrackLength => "Track length",
             Self::Composer => "Composer",
             Self::Bpm => "BPM",
         }
@@ -457,6 +454,12 @@ impl QueueDisplayField {
 
 fn default_queue_display_fields() -> Vec<QueueDisplayField> {
     vec![QueueDisplayField::Title]
+}
+
+fn move_queue_entry_to_front(queue: &mut [QueueEntry], current_index: usize) {
+    if current_index < queue.len() && current_index > 0 {
+        queue[..=current_index].rotate_right(1);
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -821,6 +824,8 @@ impl MusicApp {
         let eq_band_count = data.eq_band_count;
         let eq_enabled = data.eq_enabled;
         let now_playing_left_fraction = data.now_playing_left_fraction;
+        data.queue_display_fields
+            .retain(|field| QueueDisplayField::ALL.contains(field));
         if data.queue_display_fields.is_empty() {
             data.queue_display_fields = default_queue_display_fields();
         }
@@ -1504,19 +1509,46 @@ impl MusicApp {
     }
 
     fn stop(&mut self) {
+        self.stop_audio();
+        self.queue_index = None;
+        self.current_title.clear();
+        self.track_duration = None;
+        self.waveform.clear();
+        self.waveform_track = None;
+        self.status = "Playback stopped.".to_owned();
+        self.save();
+    }
+
+    fn stop_audio(&mut self) {
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
         if let Some(keepalive) = &self.hdmi_keepalive {
             keepalive.pause();
         }
-        self.queue_index = None;
-        self.current_title.clear();
-        self.track_duration = None;
         self.paused = false;
-        self.waveform.clear();
-        self.waveform_track = None;
-        self.status = "Playback stopped.".to_owned();
+    }
+
+    fn stop_button(&mut self) {
+        if self.sink.is_some() {
+            self.stop_audio();
+            self.status =
+                "Playback stopped. Press Stop again to move this track to the top of the queue."
+                    .to_owned();
+            self.save();
+            return;
+        }
+
+        let Some(current_index) = self
+            .queue_index
+            .filter(|index| *index < self.data.queue.len())
+        else {
+            self.status = "There is no current track to move to the top of the queue.".to_owned();
+            return;
+        };
+        move_queue_entry_to_front(&mut self.data.queue, current_index);
+        self.queue_index = Some(0);
+        self.status = "Current track moved to the top of the queue.".to_owned();
         self.save();
     }
 
@@ -1530,7 +1562,9 @@ impl MusicApp {
         if index + 1 < self.data.queue.len() {
             self.play_queue_index(index + 1);
         } else {
-            self.stop();
+            self.stop_audio();
+            self.status = "Playback finished.".to_owned();
+            self.save();
         }
     }
 
@@ -1767,6 +1801,7 @@ impl MusicApp {
             }
         }
         egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show_rows(
                 ui,
@@ -2110,7 +2145,9 @@ impl MusicApp {
                     };
                     let response = ui.add_sized(
                         [ui.available_width(), row_height],
-                        egui::Label::new(format!("{marker}  {title}")).sense(egui::Sense::click()),
+                        egui::Label::new(format!("{marker}  {title}"))
+                            .halign(egui::Align::Min)
+                            .sense(egui::Sense::click()),
                     );
                     if response.clicked() {
                         play_index = Some(index);
@@ -2157,7 +2194,7 @@ impl MusicApp {
                 .open(&mut self.show_queue_display_options)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
-                    ui.label("Select the ID tags to show for each queued track.");
+                    ui.label("Select the track information to show for each queued track.");
                     for (index, field) in QueueDisplayField::ALL.iter().enumerate() {
                         display_changed |=
                             ui.checkbox(&mut selected[index], field.label()).changed();
@@ -2379,7 +2416,7 @@ impl eframe::App for MusicApp {
                     self.play_pause();
                 }
                 if ui.button("⏹").on_hover_text("Stop").clicked() {
-                    self.stop();
+                    self.stop_button();
                 }
                 if ui.button("⏭").on_hover_text("Next track").clicked() {
                     self.next_track();
@@ -2817,16 +2854,18 @@ fn read_track(path: &Path, artwork_dir: &Path) -> Track {
             .title()
             .map(|value| value.to_string())
             .unwrap_or(track.title);
-        track.artist = tag
-            .get_string(&lofty::tag::ItemKey::TrackArtist)
-            .map(str::to_owned)
-            .or_else(|| tag.artist().map(|value| value.into_owned()))
-            .unwrap_or_default();
-        track.album_artist = tag
-            .get_string(&lofty::tag::ItemKey::AlbumArtist)
-            .map(str::to_owned)
-            .filter(|artist| !artist.is_empty())
-            .unwrap_or_else(|| track.artist.clone());
+        track.artist = first_tag_value(&tagged_file, |tag| {
+            tag.artist().map(|value| value.into_owned()).or_else(|| {
+                tag.get_string(&lofty::tag::ItemKey::TrackArtist)
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_default();
+        track.album_artist = first_tag_value(&tagged_file, |tag| {
+            tag.get_string(&lofty::tag::ItemKey::AlbumArtist)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| track.artist.clone());
         track.album = tag
             .album()
             .map(|value| value.into_owned())
@@ -2836,22 +2875,40 @@ fn read_track(path: &Path, artwork_dir: &Path) -> Track {
             .map(|value| value.into_owned())
             .unwrap_or_default();
         track.year = tag.year();
-        track.track_number = tag
-            .get_string(&lofty::tag::ItemKey::TrackNumber)
-            .map(str::to_owned);
-        track.disc_number = tag
-            .get_string(&lofty::tag::ItemKey::DiscNumber)
-            .map(str::to_owned);
-        track.composer = tag
-            .get_string(&lofty::tag::ItemKey::Composer)
-            .unwrap_or_default()
-            .to_owned();
-        track.bpm = tag
-            .get_string(&lofty::tag::ItemKey::Bpm)
-            .or_else(|| tag.get_string(&lofty::tag::ItemKey::IntegerBpm))
-            .map(str::to_owned);
+        track.track_number = first_tag_value(&tagged_file, |tag| {
+            tag.get_string(&lofty::tag::ItemKey::TrackNumber)
+                .map(str::to_owned)
+                .or_else(|| tag.track().map(|number| number.to_string()))
+        });
+        track.disc_number = first_tag_value(&tagged_file, |tag| {
+            tag.get_string(&lofty::tag::ItemKey::DiscNumber)
+                .map(str::to_owned)
+                .or_else(|| tag.disk().map(|number| number.to_string()))
+        });
     }
     track
+}
+
+fn first_tag_value(
+    tagged_file: &lofty::file::TaggedFile,
+    extract: impl Fn(&lofty::tag::Tag) -> Option<String>,
+) -> Option<String> {
+    first_tag_value_from_tags(
+        tagged_file.primary_tag(),
+        tagged_file.tags().iter(),
+        extract,
+    )
+}
+
+fn first_tag_value_from_tags<'a>(
+    primary_tag: Option<&'a lofty::tag::Tag>,
+    tags: impl Iterator<Item = &'a lofty::tag::Tag>,
+    extract: impl Fn(&lofty::tag::Tag) -> Option<String>,
+) -> Option<String> {
+    primary_tag
+        .into_iter()
+        .chain(tags)
+        .find_map(|tag| extract(tag).filter(|value| !value.trim().is_empty()))
 }
 
 fn main() -> eframe::Result {
@@ -2916,8 +2973,9 @@ fn install_japanese_font_fallback(ctx: &egui::Context) -> Result<(), String> {
 mod tests {
     use super::{
         EQ_BAND_COUNTS, LibraryData, LibraryView, QueueDisplayField, QueueEntry, Track,
-        available_library_view, collect_audio_files, decode_artwork, eq_frequencies, gallery_items,
-        is_in_scan_scope, is_supported_audio_file, remap_eq_gains, track_group_value,
+        available_library_view, collect_audio_files, decode_artwork, eq_frequencies,
+        first_tag_value_from_tags, gallery_items, is_in_scan_scope, is_supported_audio_file,
+        move_queue_entry_to_front, remap_eq_gains, track_group_value,
     };
     use std::{
         fs,
@@ -3075,6 +3133,14 @@ mod tests {
             serde_json::from_str(&saved).expect("restore serialized library");
         assert_eq!(restored.queue[0].path, library.queue[0].path);
         assert_eq!(restored.queue[0].title, "Tagged title");
+
+        let legacy_display_fields = r#"{"folders":[],"tracks":[],"playlists":[],"queue_display_fields":["Composer","Bpm"]}"#;
+        let migrated: LibraryData = serde_json::from_str(legacy_display_fields)
+            .expect("load previously available queue display fields");
+        assert_eq!(
+            migrated.queue_display_fields,
+            vec![QueueDisplayField::Composer, QueueDisplayField::Bpm]
+        );
     }
 
     #[test]
@@ -3085,6 +3151,8 @@ mod tests {
             album: "Album".to_owned(),
             year: Some(2024),
             track_number: Some("7".to_owned()),
+            disc_number: Some("2".to_owned()),
+            duration_secs: Some(184),
             ..QueueEntry::default()
         };
         assert_eq!(
@@ -3105,7 +3173,63 @@ mod tests {
                 .as_deref(),
             Some("7")
         );
-        assert_eq!(entry.display_value(QueueDisplayField::Composer), None);
+        assert_eq!(
+            entry
+                .display_value(QueueDisplayField::DiscNumber)
+                .as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            entry
+                .display_value(QueueDisplayField::TrackLength)
+                .as_deref(),
+            Some("3:04")
+        );
+        assert!(!QueueDisplayField::ALL.contains(&QueueDisplayField::Composer));
+        assert!(!QueueDisplayField::ALL.contains(&QueueDisplayField::Bpm));
+    }
+
+    #[test]
+    fn tag_lookup_falls_back_to_other_tags_and_accessor_values() {
+        let primary = lofty::tag::Tag::new(lofty::tag::TagType::Id3v2);
+        let mut fallback = lofty::tag::Tag::new(lofty::tag::TagType::VorbisComments);
+        lofty::tag::Accessor::set_artist(&mut fallback, "Artist".to_owned());
+        lofty::tag::Accessor::set_track(&mut fallback, 7);
+        lofty::tag::Accessor::set_disk(&mut fallback, 2);
+        let tags = std::iter::once(&fallback);
+
+        assert_eq!(
+            first_tag_value_from_tags(Some(&primary), tags, |tag| {
+                lofty::tag::Accessor::artist(tag).map(|artist| artist.into_owned())
+            }),
+            Some("Artist".to_owned())
+        );
+        assert_eq!(
+            first_tag_value_from_tags(Some(&primary), std::iter::once(&fallback), |tag| {
+                tag.get_string(&lofty::tag::ItemKey::TrackNumber)
+                    .map(str::to_owned)
+                    .or_else(|| lofty::tag::Accessor::track(tag).map(|number| number.to_string()))
+            }),
+            Some("7".to_owned())
+        );
+        assert_eq!(
+            first_tag_value_from_tags(Some(&primary), std::iter::once(&fallback), |tag| {
+                tag.get_string(&lofty::tag::ItemKey::DiscNumber)
+                    .map(str::to_owned)
+                    .or_else(|| lofty::tag::Accessor::disk(tag).map(|number| number.to_string()))
+            }),
+            Some("2".to_owned())
+        );
+    }
+
+    #[test]
+    fn moving_stopped_track_to_queue_top_preserves_order() {
+        let mut queue = ["first", "current", "last"].map(|title| QueueEntry {
+            title: title.to_owned(),
+            ..QueueEntry::default()
+        });
+        move_queue_entry_to_front(&mut queue, 1);
+        assert_eq!(queue.map(|entry| entry.title), ["current", "first", "last"]);
     }
 
     #[test]

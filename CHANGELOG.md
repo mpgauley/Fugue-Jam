@@ -5,6 +5,19 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 11
+
+- Changed Stop behavior: the first press stops playback but retains the current
+  track; pressing Stop again moves that track to the top of the queue.
+- Added track length to the customizable Now Playing queue fields and removed
+  composer and BPM from the available choices.
+- Improved artist, track number, and disc number tag lookup across all
+  available tags and Lofty's format-specific accessors.
+- Re-scanning the library refreshes the corrected tag values for existing
+  tracks.
+- Expanded the Library grid scroll area to fill the available frame.
+- Left-aligned Now Playing queue content.
+
 ## Version 10
 
 - Added **Customize display…** to the Now Playing queue, with selections for
