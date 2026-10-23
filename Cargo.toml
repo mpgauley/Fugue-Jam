@@ -1,11 +1,12 @@
 [package]
 name = "fugue-jam"
-version = "4.0.0"
+version = "5.0.0"
 edition = "2024"
 description = "A local-first Linux music player"
 license = "Apache-2.0"
 
 [dependencies]
+cpal = "0.15"
 directories = "6"
 eframe = "0.31"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }

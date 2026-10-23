@@ -5,6 +5,21 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 5
+
+- Made equalizer adjustments, presets, and the enable toggle affect active
+  playback immediately.
+- Added a waveform and playback-progress timeline above the transport controls,
+  with click-to-seek support and visible seek errors.
+- Detects HDMI default audio outputs and keeps them active with a silent audio
+  stream while playback is paused.
+- Added **Scan for changes…** to discover new files and remove files no longer
+  present under the selected scan folder. Missing tracks are removed only after
+  a successful scan and are also removed from static playlists, the queue, and
+  the current selection.
+- Kept removal scope consistent with the recursive-subfolder setting so scans
+  that skip subfolders do not prune those tracks.
+
 ## Version 4
 
 - Added fixed, always-visible right-side scrollbars to the Library track and

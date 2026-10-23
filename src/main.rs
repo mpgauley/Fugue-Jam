@@ -6,13 +6,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
     time::Duration,
 };
 
+use cpal::traits::{DeviceTrait, HostTrait};
 use eframe::egui::{self, TextureHandle};
 use lofty::{
     file::{AudioFile, TaggedFileExt},
@@ -28,7 +29,40 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
 const EQ_FREQUENCIES: [f32; 5] = [60.0, 250.0, 1_000.0, 4_000.0, 12_000.0];
-const PROGRAM_VERSION: u32 = 4;
+const PROGRAM_VERSION: u32 = 5;
+
+struct EqualizerControls {
+    gains: [AtomicU32; 5],
+    enabled: AtomicBool,
+    revision: AtomicU64,
+}
+
+impl EqualizerControls {
+    fn new(gains: [f32; 5], enabled: bool) -> Self {
+        Self {
+            gains: gains.map(|gain| AtomicU32::new(gain.to_bits())),
+            enabled: AtomicBool::new(enabled),
+            revision: AtomicU64::new(0),
+        }
+    }
+
+    fn update(&self, gains: &[f32; 5], enabled: bool) {
+        for (target, gain) in self.gains.iter().zip(gains) {
+            target.store(gain.to_bits(), Ordering::Relaxed);
+        }
+        self.enabled.store(enabled, Ordering::Relaxed);
+        self.revision.fetch_add(1, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> ([f32; 5], bool) {
+        (
+            self.gains
+                .each_ref()
+                .map(|gain| f32::from_bits(gain.load(Ordering::Relaxed))),
+            self.enabled.load(Ordering::Relaxed),
+        )
+    }
+}
 
 struct Biquad {
     coefficients: [f32; 5],
@@ -37,6 +71,16 @@ struct Biquad {
 
 impl Biquad {
     fn peaking(frequency: f32, gain_db: f32, sample_rate: u32, channels: u16) -> Self {
+        Self {
+            coefficients: Self::coefficients(frequency, gain_db, sample_rate),
+            state: vec![(0.0, 0.0); channels.max(1) as usize],
+        }
+    }
+
+    fn coefficients(frequency: f32, gain_db: f32, sample_rate: u32) -> [f32; 5] {
+        if gain_db.abs() < f32::EPSILON {
+            return [1.0, 0.0, 0.0, 0.0, 0.0];
+        }
         let nyquist = sample_rate as f32 / 2.0;
         let frequency = frequency.min(nyquist * 0.95).max(1.0);
         let omega = std::f32::consts::TAU * frequency / sample_rate as f32;
@@ -44,16 +88,17 @@ impl Biquad {
         let amplitude = 10.0_f32.powf(gain_db / 40.0);
         let a0 = 1.0 + alpha / amplitude;
         let cosine = omega.cos();
-        Self {
-            coefficients: [
-                (1.0 + alpha * amplitude) / a0,
-                (-2.0 * cosine) / a0,
-                (1.0 - alpha * amplitude) / a0,
-                (-2.0 * cosine) / a0,
-                (1.0 - alpha / amplitude) / a0,
-            ],
-            state: vec![(0.0, 0.0); channels.max(1) as usize],
-        }
+        [
+            (1.0 + alpha * amplitude) / a0,
+            (-2.0 * cosine) / a0,
+            (1.0 - alpha * amplitude) / a0,
+            (-2.0 * cosine) / a0,
+            (1.0 - alpha / amplitude) / a0,
+        ]
+    }
+
+    fn set_gain(&mut self, frequency: f32, gain_db: f32, sample_rate: u32) {
+        self.coefficients = Self::coefficients(frequency, gain_db, sample_rate);
     }
 
     fn process(&mut self, sample: f32, channel: usize) -> f32 {
@@ -71,28 +116,33 @@ struct EqualizedSource<S> {
     filters: Vec<Biquad>,
     channel: usize,
     channels: usize,
+    controls: Arc<EqualizerControls>,
+    revision: u64,
 }
 
 impl<S: Source<Item = f32>> EqualizedSource<S> {
-    fn new(input: S, bands: &[f32; 5], enabled: bool) -> Self {
+    fn new(input: S, controls: Arc<EqualizerControls>) -> Self {
         let channels = input.channels().max(1) as usize;
-        let filters = if enabled {
-            EQ_FREQUENCIES
-                .iter()
-                .zip(bands)
-                .filter(|(_, gain)| gain.abs() > f32::EPSILON)
-                .map(|(&frequency, &gain)| {
-                    Biquad::peaking(frequency, gain, input.sample_rate(), channels as u16)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let (bands, enabled) = controls.snapshot();
+        let filters = EQ_FREQUENCIES
+            .iter()
+            .zip(bands)
+            .map(|(&frequency, gain)| {
+                Biquad::peaking(
+                    frequency,
+                    if enabled { gain } else { 0.0 },
+                    input.sample_rate(),
+                    channels as u16,
+                )
+            })
+            .collect();
         Self {
             input,
             filters,
             channel: 0,
             channels,
+            revision: controls.revision.load(Ordering::Acquire),
+            controls,
         }
     }
 }
@@ -102,6 +152,24 @@ impl<S: Source<Item = f32>> Iterator for EqualizedSource<S> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut sample = self.input.next()?;
+        if self.channel == 0 {
+            let revision = self.controls.revision.load(Ordering::Acquire);
+            if revision != self.revision {
+                let (bands, enabled) = self.controls.snapshot();
+                for (filter, (&frequency, gain)) in self
+                    .filters
+                    .iter_mut()
+                    .zip(EQ_FREQUENCIES.iter().zip(bands))
+                {
+                    filter.set_gain(
+                        frequency,
+                        if enabled { gain } else { 0.0 },
+                        self.input.sample_rate(),
+                    );
+                }
+                self.revision = revision;
+            }
+        }
         for filter in &mut self.filters {
             sample = filter.process(sample, self.channel);
         }
@@ -125,6 +193,34 @@ impl<S: Source<Item = f32>> Source for EqualizedSource<S> {
 
     fn total_duration(&self) -> Option<Duration> {
         self.input.total_duration()
+    }
+}
+
+struct SilenceSource;
+
+impl Iterator for SilenceSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(0.0)
+    }
+}
+
+impl Source for SilenceSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        Some(4096)
+    }
+
+    fn channels(&self) -> u16 {
+        2
+    }
+
+    fn sample_rate(&self) -> u32 {
+        48_000
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
     }
 }
 
@@ -241,12 +337,18 @@ struct MusicApp {
     _stream: Option<OutputStream>,
     stream_handle: Option<OutputStreamHandle>,
     sink: Option<Sink>,
+    hdmi_keepalive: Option<Sink>,
     paused: bool,
     current_title: String,
     track_duration: Option<Duration>,
     eq_bands: [f32; 5],
     eq_enabled: bool,
     eq_preset: usize,
+    eq_controls: Arc<EqualizerControls>,
+    waveform: Vec<f32>,
+    waveform_track: Option<PathBuf>,
+    waveform_requests: Sender<PathBuf>,
+    waveform_results: Receiver<Result<(PathBuf, Vec<f32>), (PathBuf, String)>>,
     scan_subfolders: bool,
     scan_task: Option<ScanTask>,
     texture_cache: HashMap<PathBuf, TextureHandle>,
@@ -265,6 +367,9 @@ struct ScanTask {
     receiver: Receiver<ScanMessage>,
     added_count: usize,
     refreshed_count: usize,
+    remove_missing: bool,
+    recursive: bool,
+    seen_tracks: HashSet<PathBuf>,
 }
 
 enum ScanMessage {
@@ -318,12 +423,52 @@ impl MusicApp {
                 format!("Could not open the saved library: {error}"),
             ),
         };
+        let output_device_name = cpal::default_host()
+            .default_output_device()
+            .and_then(|device| match device.name() {
+                Ok(name) => Some(name),
+                Err(error) => {
+                    eprintln!("Could not identify the default audio output: {error}");
+                    None
+                }
+            });
+        let hdmi_output = output_device_name
+            .as_deref()
+            .is_some_and(|name| name.to_lowercase().contains("hdmi"));
         let (stream, stream_handle) = match OutputStream::try_default() {
             Ok((stream, handle)) => (Some(stream), Some(handle)),
             Err(error) => {
                 status = format!("Audio output is unavailable: {error}. {status}");
                 (None, None)
             }
+        };
+        let hdmi_keepalive = if hdmi_output {
+            match stream_handle.as_ref() {
+                Some(handle) => match Sink::try_new(handle) {
+                    Ok(sink) => {
+                        sink.append(SilenceSource);
+                        sink.pause();
+                        status = format!(
+                            "HDMI output detected; silent audio will keep the connection active while playback is paused. {status}"
+                        );
+                        Some(sink)
+                    }
+                    Err(error) => {
+                        status = format!(
+                            "HDMI output detected, but silent keep-alive could not be started: {error}. {status}"
+                        );
+                        None
+                    }
+                },
+                None => {
+                    status = format!(
+                        "HDMI output detected, but silent keep-alive could not start because audio output is unavailable. {status}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
         let (artwork_requests, request_receiver) = mpsc::channel::<PathBuf>();
         let (result_sender, artwork_results) =
@@ -338,6 +483,20 @@ impl MusicApp {
                 }
             }
         });
+        let (waveform_requests, waveform_request_receiver) = mpsc::channel::<PathBuf>();
+        let (waveform_result_sender, waveform_results) =
+            mpsc::channel::<Result<(PathBuf, Vec<f32>), (PathBuf, String)>>();
+        thread::spawn(move || {
+            while let Ok(path) = waveform_request_receiver.recv() {
+                let result = decode_waveform(&path)
+                    .map(|waveform| (path.clone(), waveform))
+                    .map_err(|error| (path, error));
+                if waveform_result_sender.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        let eq_controls = Arc::new(EqualizerControls::new([0.0; 5], true));
         let library_indices = data
             .tracks
             .iter()
@@ -365,12 +524,18 @@ impl MusicApp {
             _stream: stream,
             stream_handle,
             sink: None,
+            hdmi_keepalive,
             paused: false,
             current_title: String::new(),
             track_duration: None,
             eq_bands: [0.0; 5],
             eq_enabled: true,
             eq_preset: 0,
+            eq_controls,
+            waveform: Vec::new(),
+            waveform_track: None,
+            waveform_requests,
+            waveform_results,
             scan_subfolders: true,
             scan_task: None,
             texture_cache: HashMap::new(),
@@ -397,12 +562,24 @@ impl MusicApp {
     }
 
     fn add_folder(&mut self) {
-        if self.scan_task.is_some() {
-            return;
-        }
         let Some(folder) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
+        self.start_folder_scan(folder, false);
+    }
+
+    fn rescan_folder(&mut self) {
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        self.start_folder_scan(folder, true);
+    }
+
+    fn start_folder_scan(&mut self, folder: PathBuf, remove_missing: bool) {
+        if self.scan_task.is_some() {
+            self.status = "A library scan is already running.".to_owned();
+            return;
+        }
         if !self.data.folders.contains(&folder) {
             self.data.folders.push(folder.clone());
         }
@@ -437,6 +614,9 @@ impl MusicApp {
             receiver,
             added_count: 0,
             refreshed_count: 0,
+            remove_missing,
+            recursive: recurse,
+            seen_tracks: HashSet::new(),
         });
     }
 
@@ -456,6 +636,9 @@ impl MusicApp {
                     }
                 }
                 ScanMessage::Track(track) => {
+                    if let Some(task) = &mut self.scan_task {
+                        task.seen_tracks.insert(track.path.clone());
+                    }
                     if let Some(index) = self.library_indices.get(&track.path).copied() {
                         self.data.tracks[index] = track;
                         refreshed_count += 1;
@@ -486,16 +669,30 @@ impl MusicApp {
             task.refreshed_count += refreshed_count;
         }
         if let Some(result) = finish_result {
-            let (folder, added_count, refreshed_count) = self
-                .scan_task
-                .as_ref()
-                .map(|task| (task.folder.clone(), task.added_count, task.refreshed_count))
-                .unwrap_or_default();
+            let (folder, added_count, refreshed_count, remove_missing, recursive, seen_tracks) =
+                self.scan_task
+                    .as_ref()
+                    .map(|task| {
+                        (
+                            task.folder.clone(),
+                            task.added_count,
+                            task.refreshed_count,
+                            task.remove_missing,
+                            task.recursive,
+                            task.seen_tracks.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
             match result {
                 Ok(()) => {
+                    let removed_count = if remove_missing {
+                        self.remove_missing_tracks(&folder, recursive, &seen_tracks)
+                    } else {
+                        0
+                    };
                     self.status = format!(
-                        "Added {added_count} and refreshed {refreshed_count} track(s) from {}.",
-                        folder.display()
+                        "Added {added_count}, refreshed {refreshed_count}, and removed {removed_count} missing track(s) from {}.",
+                        folder.display(),
                     );
                     self.save();
                 }
@@ -513,6 +710,73 @@ impl MusicApp {
                 task.folder.display(),
                 task.progress.load(Ordering::Relaxed)
             );
+        }
+    }
+
+    fn remove_missing_tracks(
+        &mut self,
+        folder: &Path,
+        recursive: bool,
+        seen_tracks: &HashSet<PathBuf>,
+    ) -> usize {
+        let removed: HashSet<PathBuf> = self
+            .data
+            .tracks
+            .iter()
+            .filter(|track| {
+                is_in_scan_scope(&track.path, folder, recursive)
+                    && !seen_tracks.contains(&track.path)
+            })
+            .map(|track| track.path.clone())
+            .collect();
+        if removed.is_empty() {
+            return 0;
+        }
+        let current_path = self
+            .queue_index
+            .and_then(|index| self.queue.get(index))
+            .cloned();
+        if current_path
+            .as_ref()
+            .is_some_and(|path| removed.contains(path))
+        {
+            self.stop();
+        }
+        self.data
+            .tracks
+            .retain(|track| !removed.contains(&track.path));
+        self.data.playlists.iter_mut().for_each(|playlist| {
+            playlist.tracks.retain(|path| !removed.contains(path));
+        });
+        self.selected_paths.retain(|path| !removed.contains(path));
+        self.queue.retain(|path| !removed.contains(path));
+        if let Some(path) = current_path.filter(|path| !removed.contains(path)) {
+            self.queue_index = self.queue.iter().position(|queued| queued == &path);
+        } else if self.sink.is_none() {
+            self.queue_index = None;
+        }
+        self.library_indices = self
+            .data
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(index, track)| (track.path.clone(), index))
+            .collect();
+        removed.len()
+    }
+
+    fn finish_waveform_loads(&mut self) {
+        for result in self.waveform_results.try_iter() {
+            match result {
+                Ok((path, waveform)) if self.waveform_track.as_ref() == Some(&path) => {
+                    self.waveform = waveform;
+                }
+                Ok(_) => {}
+                Err((path, error)) if self.waveform_track.as_ref() == Some(&path) => {
+                    self.status = format!("Could not generate waveform: {error}");
+                }
+                Err(_) => {}
+            }
         }
     }
 
@@ -735,8 +999,7 @@ impl MusicApp {
         let duration = source.total_duration();
         let source = EqualizedSource::new(
             source.convert_samples::<f32>(),
-            &self.eq_bands,
-            self.eq_enabled,
+            Arc::clone(&self.eq_controls),
         );
         let sink = match Sink::try_new(handle) {
             Ok(sink) => sink,
@@ -750,6 +1013,11 @@ impl MusicApp {
         self.queue_index = Some(index);
         self.track_duration = duration;
         self.paused = false;
+        self.waveform.clear();
+        self.waveform_track = Some(path.clone());
+        if self.waveform_requests.send(path.clone()).is_err() {
+            self.status = "Waveform generator is unavailable.".to_owned();
+        }
         self.current_title = self
             .data
             .tracks
@@ -771,10 +1039,16 @@ impl MusicApp {
         };
         if self.paused {
             sink.play();
+            if let Some(keepalive) = &self.hdmi_keepalive {
+                keepalive.pause();
+            }
             self.paused = false;
             self.status = "Playback resumed.".to_owned();
         } else {
             sink.pause();
+            if let Some(keepalive) = &self.hdmi_keepalive {
+                keepalive.play();
+            }
             self.paused = true;
             self.status = "Playback paused.".to_owned();
         }
@@ -784,10 +1058,15 @@ impl MusicApp {
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
+        if let Some(keepalive) = &self.hdmi_keepalive {
+            keepalive.pause();
+        }
         self.queue_index = None;
         self.current_title.clear();
         self.track_duration = None;
         self.paused = false;
+        self.waveform.clear();
+        self.waveform_track = None;
         self.status = "Playback stopped.".to_owned();
     }
 
@@ -833,6 +1112,16 @@ impl MusicApp {
                 .clicked()
             {
                 self.add_folder();
+            }
+            if ui
+                .add_enabled(
+                    self.scan_task.is_none() && !self.data.folders.is_empty(),
+                    egui::Button::new("Scan for changes…"),
+                )
+                .on_hover_text("Choose a folder to discover new files and remove missing files")
+                .clicked()
+            {
+                self.rescan_folder();
             }
             ui.add_enabled_ui(self.scan_task.is_none(), |ui| {
                 ui.checkbox(&mut self.scan_subfolders, "Scan subfolders");
@@ -1380,7 +1669,9 @@ impl MusicApp {
     fn render_equalization(&mut self, ui: &mut egui::Ui) {
         ui.heading("Equalization");
         ui.label("Five-band equalizer controls");
-        ui.checkbox(&mut self.eq_enabled, "Enable equalizer");
+        let mut controls_changed = ui
+            .checkbox(&mut self.eq_enabled, "Enable equalizer")
+            .changed();
         let presets = ["Custom", "Flat", "Bass boost", "Treble boost", "Vocal"];
         egui::ComboBox::from_id_salt("eq_preset")
             .selected_text(presets[self.eq_preset.min(presets.len() - 1)])
@@ -1390,6 +1681,7 @@ impl MusicApp {
                         .selectable_value(&mut self.eq_preset, index, *preset)
                         .clicked()
                     {
+                        controls_changed = true;
                         self.eq_bands = match index {
                             1 => [0.0; 5],
                             2 => [6.0, 4.0, 0.0, -1.0, 0.0],
@@ -1423,9 +1715,13 @@ impl MusicApp {
         });
         if eq_changed {
             self.eq_preset = 0;
+            controls_changed = true;
+        }
+        if controls_changed {
+            self.eq_controls.update(&self.eq_bands, self.eq_enabled);
         }
         ui.separator();
-        ui.label("Equalizer changes apply to tracks started after adjusting them.");
+        ui.label("Equalizer changes apply immediately during playback.");
     }
 
     fn render_now_playing_cover(&mut self, ui: &mut egui::Ui) {
@@ -1468,6 +1764,7 @@ impl eframe::App for MusicApp {
         self.check_playback_end();
         self.finish_scan_if_ready();
         self.finish_artwork_loads(ctx);
+        self.finish_waveform_loads();
         egui::TopBottomPanel::top("navigation").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(format!("Fugue Jam · v{PROGRAM_VERSION}"));
@@ -1542,6 +1839,92 @@ impl eframe::App for MusicApp {
                 }
             });
         });
+        egui::TopBottomPanel::bottom("track_timeline")
+            .exact_height((ctx.screen_rect().height() * 0.10).clamp(56.0, 128.0))
+            .show(ctx, |ui| {
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), ui.available_height()),
+                    egui::Sense::click(),
+                );
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
+                let position = self.sink.as_ref().map(Sink::get_pos).unwrap_or_default();
+                let duration = self.track_duration;
+                let fraction = duration
+                    .filter(|duration| !duration.is_zero())
+                    .map(|duration| {
+                        (position.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0)
+                    })
+                    .unwrap_or(0.0);
+                let label = format!(
+                    "{}  {} / {}",
+                    if self.current_title.is_empty() {
+                        "Nothing playing"
+                    } else {
+                        &self.current_title
+                    },
+                    format_duration(position),
+                    duration
+                        .map(format_duration)
+                        .unwrap_or_else(|| "—:—".to_owned())
+                );
+                painter.text(
+                    egui::pos2(rect.left() + 10.0, rect.top() + 8.0),
+                    egui::Align2::LEFT_TOP,
+                    label,
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    ui.visuals().text_color(),
+                );
+                let waveform_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 8.0, rect.top() + 32.0),
+                    egui::pos2(rect.right() - 8.0, rect.bottom() - 8.0),
+                );
+                let center = waveform_rect.center().y;
+                let bar_count = self.waveform.len().max(1);
+                let bar_width = waveform_rect.width() / bar_count as f32;
+                for (index, peak) in self.waveform.iter().enumerate() {
+                    let x = waveform_rect.left() + index as f32 * bar_width;
+                    let half_height = peak.clamp(0.02, 1.0) * waveform_rect.height() * 0.48;
+                    let color = if index as f32 / bar_count as f32 <= fraction {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        ui.visuals().text_color().gamma_multiply(0.55)
+                    };
+                    painter.line_segment(
+                        [
+                            egui::pos2(x + bar_width * 0.5, center - half_height),
+                            egui::pos2(x + bar_width * 0.5, center + half_height),
+                        ],
+                        egui::Stroke::new(bar_width.max(1.0), color),
+                    );
+                }
+                if duration.is_some() {
+                    let x = waveform_rect.left() + waveform_rect.width() * fraction;
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, waveform_rect.top()),
+                            egui::pos2(x, waveform_rect.bottom()),
+                        ],
+                        egui::Stroke::new(2.0_f32, ui.visuals().selection.stroke.color),
+                    );
+                    if response.clicked()
+                        && let Some(pointer) = response.interact_pointer_pos()
+                    {
+                        let seek_fraction = ((pointer.x - waveform_rect.left())
+                            / waveform_rect.width())
+                        .clamp(0.0, 1.0);
+                        if let (Some(sink), Some(duration)) = (&self.sink, duration) {
+                            let target = duration.mul_f32(seek_fraction);
+                            match sink.try_seek(target) {
+                                Ok(()) => {
+                                    self.status = format!("Seeking to {}.", format_duration(target))
+                                }
+                                Err(error) => self.status = format!("Could not seek: {error}"),
+                            }
+                        }
+                    }
+                }
+            });
         match self.tab {
             Tab::NowPlaying => {
                 let available_width = ctx.available_rect().width();
@@ -1571,6 +1954,10 @@ impl eframe::App for MusicApp {
 fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+fn is_in_scan_scope(path: &Path, folder: &Path, recursive: bool) -> bool {
+    path.starts_with(folder) && (recursive || path.parent() == Some(folder))
 }
 
 fn track_group_value(track: &Track, organize_by: &str) -> String {
@@ -1713,6 +2100,40 @@ fn scan_folder(
     Ok(())
 }
 
+fn decode_waveform(path: &Path) -> Result<Vec<f32>, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let decoder = Decoder::new(BufReader::new(file)).map_err(|error| error.to_string())?;
+    let mut peaks = Vec::new();
+    let mut peak = 0.0_f32;
+    let mut sample_count = 0_u32;
+    for sample in decoder.convert_samples::<f32>() {
+        peak = peak.max(sample.abs());
+        sample_count += 1;
+        if sample_count == 2048 {
+            peaks.push(peak);
+            peak = 0.0;
+            sample_count = 0;
+        }
+    }
+    if sample_count > 0 {
+        peaks.push(peak);
+    }
+    if peaks.len() > 256 {
+        let source = std::mem::take(&mut peaks);
+        peaks = (0..256)
+            .map(|index| {
+                let start = index * source.len() / 256;
+                let end = ((index + 1) * source.len() / 256).max(start + 1);
+                source[start..end.min(source.len())]
+                    .iter()
+                    .copied()
+                    .fold(0.0, f32::max)
+            })
+            .collect();
+    }
+    Ok(peaks)
+}
+
 fn decode_artwork(path: &Path) -> Result<egui::ColorImage, String> {
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let image = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
@@ -1804,7 +2225,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        LibraryView, Track, collect_audio_files, decode_artwork, gallery_items,
+        LibraryView, Track, collect_audio_files, decode_artwork, gallery_items, is_in_scan_scope,
         is_supported_audio_file, track_group_value,
     };
     use std::{
@@ -1911,5 +2332,30 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn scan_scope_respects_recursive_setting() {
+        let folder = Path::new("/music");
+        assert!(is_in_scan_scope(
+            Path::new("/music/track.flac"),
+            folder,
+            false
+        ));
+        assert!(!is_in_scan_scope(
+            Path::new("/music/album/track.flac"),
+            folder,
+            false
+        ));
+        assert!(is_in_scan_scope(
+            Path::new("/music/album/track.flac"),
+            folder,
+            true
+        ));
+        assert!(!is_in_scan_scope(
+            Path::new("/music-old/track.flac"),
+            folder,
+            true
+        ));
     }
 }
