@@ -5,6 +5,16 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 3
+
+- Moved album artwork decoding and texture loading to a background worker so
+  scrolling and tab navigation remain responsive.
+- Virtualized track and album grids, requesting artwork only as visible items
+  are rendered and displaying items progressively as scan and artwork results
+  arrive.
+- Updated the album view to show only cover art, using the album name when no
+  cover art is available.
+
 ## Version 2
 
 - Displayed the whole-number program version in the app header.

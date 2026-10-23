@@ -7,7 +7,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::{self, Receiver, Sender},
     },
     thread,
     time::Duration,
@@ -28,7 +28,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
 const EQ_FREQUENCIES: [f32; 5] = [60.0, 250.0, 1_000.0, 4_000.0, 12_000.0];
-const PROGRAM_VERSION: u32 = 2;
+const PROGRAM_VERSION: u32 = 3;
 
 struct Biquad {
     coefficients: [f32; 5],
@@ -248,6 +248,11 @@ struct MusicApp {
     scan_subfolders: bool,
     scan_task: Option<ScanTask>,
     texture_cache: HashMap<PathBuf, TextureHandle>,
+    artwork_requests: Sender<PathBuf>,
+    artwork_results: Receiver<Result<(PathBuf, egui::ColorImage), (PathBuf, String)>>,
+    artwork_pending: HashSet<PathBuf>,
+    artwork_failed: HashSet<PathBuf>,
+    library_indices: HashMap<PathBuf, usize>,
     now_playing_left_fraction: f32,
 }
 
@@ -255,7 +260,15 @@ struct ScanTask {
     folder: PathBuf,
     progress: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
-    receiver: Receiver<Result<Vec<Track>, String>>,
+    receiver: Receiver<ScanMessage>,
+    added_count: usize,
+    refreshed_count: usize,
+}
+
+enum ScanMessage {
+    Total(usize),
+    Track(Track),
+    Finished(Result<(), String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -293,6 +306,25 @@ impl MusicApp {
                 (None, None)
             }
         };
+        let (artwork_requests, request_receiver) = mpsc::channel::<PathBuf>();
+        let (result_sender, artwork_results) =
+            mpsc::channel::<Result<(PathBuf, egui::ColorImage), (PathBuf, String)>>();
+        thread::spawn(move || {
+            while let Ok(path) = request_receiver.recv() {
+                let result = decode_artwork(&path)
+                    .map(|image| (path.clone(), image))
+                    .map_err(|error| (path, error));
+                if result_sender.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        let library_indices = data
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(index, track)| (track.path.clone(), index))
+            .collect();
         Self {
             data_path,
             data,
@@ -321,6 +353,11 @@ impl MusicApp {
             scan_subfolders: true,
             scan_task: None,
             texture_cache: HashMap::new(),
+            artwork_requests,
+            artwork_results,
+            artwork_pending: HashSet::new(),
+            artwork_failed: HashSet::new(),
+            library_indices,
             now_playing_left_fraction: 0.75,
         }
     }
@@ -367,8 +404,9 @@ impl MusicApp {
                 &artwork_dir,
                 &worker_progress,
                 &worker_total,
+                &sender,
             );
-            let _ = sender.send(result);
+            let _ = sender.send(ScanMessage::Finished(result));
         });
         self.status = format!("Scanning {}…", folder.display());
         self.scan_task = Some(ScanTask {
@@ -376,6 +414,8 @@ impl MusicApp {
             progress,
             total,
             receiver,
+            added_count: 0,
+            refreshed_count: 0,
         });
     }
 
@@ -383,85 +423,113 @@ impl MusicApp {
         let Some(task) = self.scan_task.as_ref() else {
             return;
         };
-        match task.receiver.try_recv() {
-            Ok(Ok(scanned_tracks)) => {
-                let folder = task.folder.clone();
-                let mut track_indices: HashMap<PathBuf, usize> = self
-                    .data
-                    .tracks
-                    .iter()
-                    .enumerate()
-                    .map(|(index, track)| (track.path.clone(), index))
-                    .collect();
-                let mut added_count = 0;
-                let mut refreshed_count = 0;
-                for track in scanned_tracks {
-                    if let Some(index) = track_indices.get(&track.path).copied() {
+        let messages: Vec<ScanMessage> = task.receiver.try_iter().take(128).collect();
+        let mut added_count = 0;
+        let mut refreshed_count = 0;
+        let mut finish_result = None;
+        for message in messages {
+            match message {
+                ScanMessage::Total(total) => {
+                    if let Some(task) = &self.scan_task {
+                        task.total.store(total, Ordering::Relaxed);
+                    }
+                }
+                ScanMessage::Track(track) => {
+                    if let Some(index) = self.library_indices.get(&track.path).copied() {
                         self.data.tracks[index] = track;
                         refreshed_count += 1;
                     } else {
-                        track_indices.insert(track.path.clone(), self.data.tracks.len());
+                        self.library_indices
+                            .insert(track.path.clone(), self.data.tracks.len());
                         self.data.tracks.push(track);
                         added_count += 1;
                     }
                 }
-                self.data
-                    .tracks
-                    .sort_by_key(|track| track.display_title().to_lowercase());
-                self.status = format!(
-                    "Added {added_count} and refreshed {refreshed_count} track(s) from {}.",
-                    folder.display()
-                );
-                self.scan_task = None;
-                self.save();
+                ScanMessage::Finished(result) => finish_result = Some(result),
             }
-            Ok(Err(error)) => {
-                self.status = format!("Could not scan folder: {error}");
-                self.scan_task = None;
+        }
+        if finish_result.is_some() {
+            self.data
+                .tracks
+                .sort_by_key(|track| track.display_title().to_lowercase());
+            self.library_indices = self
+                .data
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(index, track)| (track.path.clone(), index))
+                .collect();
+        }
+        if let Some(task) = &mut self.scan_task {
+            task.added_count += added_count;
+            task.refreshed_count += refreshed_count;
+        }
+        if let Some(result) = finish_result {
+            let (folder, added_count, refreshed_count) = self
+                .scan_task
+                .as_ref()
+                .map(|task| (task.folder.clone(), task.added_count, task.refreshed_count))
+                .unwrap_or_default();
+            match result {
+                Ok(()) => {
+                    self.status = format!(
+                        "Added {added_count} and refreshed {refreshed_count} track(s) from {}.",
+                        folder.display()
+                    );
+                    self.save();
+                }
+                Err(error) => {
+                    self.status = format!("Library scan failed: {error}");
+                    self.save();
+                }
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.status = "The library scan stopped unexpectedly.".to_owned();
-                self.scan_task = None;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
+            self.scan_task = None;
+        } else if added_count + refreshed_count > 0
+            && let Some(task) = &self.scan_task
+        {
+            self.status = format!(
+                "Scanning {}… {} track(s) loaded",
+                task.folder.display(),
+                task.progress.load(Ordering::Relaxed)
+            );
         }
     }
 
-    fn load_artwork(&mut self, ctx: &egui::Context, path: Option<&Path>) -> Option<TextureHandle> {
+    fn load_artwork(&mut self, path: Option<&Path>) -> Option<TextureHandle> {
         let path = path?;
         if let Some(texture) = self.texture_cache.get(path) {
             return Some(texture.clone());
         }
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                eprintln!(
-                    "Could not read cached album art {}: {error}",
-                    path.display()
-                );
-                return None;
+        let path = path.to_path_buf();
+        if !self.artwork_failed.contains(&path)
+            && self.artwork_pending.insert(path.clone())
+            && self.artwork_requests.send(path.clone()).is_err()
+        {
+            self.artwork_pending.remove(&path);
+            eprintln!("Album artwork loader is unavailable.");
+        }
+        None
+    }
+
+    fn finish_artwork_loads(&mut self, ctx: &egui::Context) {
+        for result in self.artwork_results.try_iter().take(8) {
+            match result {
+                Ok((path, image)) => {
+                    self.artwork_pending.remove(&path);
+                    let texture = ctx.load_texture(
+                        path.display().to_string(),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.texture_cache.insert(path, texture);
+                }
+                Err((path, error)) => {
+                    self.artwork_pending.remove(&path);
+                    self.artwork_failed.insert(path.clone());
+                    eprintln!("Could not load album art {}: {error}", path.display());
+                }
             }
-        };
-        let image = match image::load_from_memory(&bytes) {
-            Ok(image) => image.to_rgba8(),
-            Err(error) => {
-                eprintln!(
-                    "Could not decode cached album art {}: {error}",
-                    path.display()
-                );
-                return None;
-            }
-        };
-        let size = [image.width() as usize, image.height() as usize];
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-        let texture = ctx.load_texture(
-            path.display().to_string(),
-            color_image,
-            egui::TextureOptions::LINEAR,
-        );
-        self.texture_cache
-            .insert(path.to_path_buf(), texture.clone());
-        Some(texture)
+        }
     }
 
     fn add_selection_to_playlist(&mut self, playlist_index: usize) {
@@ -721,7 +789,7 @@ impl MusicApp {
         }
     }
 
-    fn render_library(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+    fn render_library(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -789,149 +857,162 @@ impl MusicApp {
                 ui.label("Your library is empty. Add a folder containing music files.");
             });
         } else if self.library_view == LibraryView::Albums {
-            self.render_album_grid(ctx, ui, &tracks);
+            self.render_album_grid(ui, &tracks);
         } else {
-            self.render_track_list(ctx, ui, &tracks);
+            self.render_track_list(ui, &tracks);
         }
     }
 
-    fn render_track_list(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, tracks: &[Track]) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_sized([48.0, 20.0], egui::Label::new(""));
-                ui.add_sized([210.0, 20.0], egui::Label::new("Track"));
-                ui.add_sized([140.0, 20.0], egui::Label::new("Album artist"));
-                ui.add_sized([150.0, 20.0], egui::Label::new("Album"));
-                ui.add_sized([48.0, 20.0], egui::Label::new("Year"));
-                ui.add_sized([58.0, 20.0], egui::Label::new("Type"));
-                ui.add_sized([55.0, 20.0], egui::Label::new("Duration"));
-            });
-            ui.separator();
-            let mut previous_group = String::new();
-            for track in tracks {
-                let group = match self.organize_by.as_str() {
-                    "Album" => track.album.clone(),
-                    "Genre" => track.genre.clone(),
-                    "Year" => track.year.map(|year| year.to_string()).unwrap_or_default(),
-                    _ => track.album_artist.clone(),
-                };
-                if group != previous_group {
-                    ui.add_space(5.0);
-                    ui.heading(if group.is_empty() {
-                        "Unknown".to_owned()
-                    } else {
-                        group.clone()
-                    });
-                    previous_group = group;
-                }
+    fn render_track_list(&mut self, ui: &mut egui::Ui, tracks: &[Track]) {
+        ui.horizontal(|ui| {
+            ui.add_sized([48.0, 20.0], egui::Label::new(""));
+            ui.add_sized([210.0, 20.0], egui::Label::new("Track"));
+            ui.add_sized([140.0, 20.0], egui::Label::new("Album artist"));
+            ui.add_sized([150.0, 20.0], egui::Label::new("Album"));
+            ui.add_sized([48.0, 20.0], egui::Label::new("Year"));
+            ui.add_sized([58.0, 20.0], egui::Label::new("Type"));
+            ui.add_sized([55.0, 20.0], egui::Label::new("Duration"));
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().show_rows(ui, 64.0, tracks.len(), |ui, row_range| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for index in row_range {
+                let track = &tracks[index];
+                let group = track_group_value(track, &self.organize_by);
+                let is_first_in_group =
+                    index == 0 || group != track_group_value(&tracks[index - 1], &self.organize_by);
+                let group_label = if group.is_empty() { "Unknown" } else { &group };
                 let path = track.path.clone();
-                let texture = self.load_artwork(ctx, track.artwork_path.as_deref());
+                let texture = self.load_artwork(track.artwork_path.as_deref());
                 let response = ui
-                    .horizontal(|ui| {
-                        let mut selected = self.selected_paths.contains(&path);
-                        if ui.checkbox(&mut selected, "").changed() {
-                            if selected {
-                                self.selected_paths.insert(path.clone());
-                            } else {
-                                self.selected_paths.remove(&path);
-                            }
-                        }
-                        if let Some(texture) = texture {
-                            ui.add(
-                                egui::Image::from_texture(&texture)
-                                    .fit_to_exact_size(egui::vec2(40.0, 40.0)),
+                    .vertical(|ui| {
+                        if is_first_in_group {
+                            ui.add_sized(
+                                [320.0, 16.0],
+                                egui::Label::new(egui::RichText::new(group_label).small()),
                             );
                         } else {
-                            ui.add_sized([40.0, 40.0], egui::Label::new("♫"));
+                            ui.add_space(16.0);
                         }
-                        if ui
-                            .add_sized(
-                                [210.0, 40.0],
-                                egui::Button::new(track.display_title()).frame(false),
-                            )
-                            .clicked()
-                        {
-                            if !self.queue.contains(&path) {
-                                self.queue.push(path.clone());
+                        ui.horizontal(|ui| {
+                            let mut selected = self.selected_paths.contains(&path);
+                            if ui.checkbox(&mut selected, "").changed() {
+                                if selected {
+                                    self.selected_paths.insert(path.clone());
+                                } else {
+                                    self.selected_paths.remove(&path);
+                                }
                             }
-                            if let Some(index) = self.queue.iter().position(|item| item == &path) {
-                                self.play_queue_index(index);
+                            if let Some(texture) = texture {
+                                ui.add(
+                                    egui::Image::from_texture(&texture)
+                                        .fit_to_exact_size(egui::vec2(40.0, 40.0)),
+                                );
+                            } else {
+                                ui.add_sized([40.0, 40.0], egui::Label::new("♫"));
                             }
-                        }
-                        ui.add_sized([140.0, 40.0], egui::Label::new(&track.album_artist));
-                        ui.add_sized([150.0, 40.0], egui::Label::new(&track.album));
-                        ui.add_sized(
-                            [48.0, 40.0],
-                            egui::Label::new(
-                                track.year.map(|year| year.to_string()).unwrap_or_default(),
-                            ),
-                        );
-                        ui.add_sized([58.0, 40.0], egui::Label::new(track.file_type()));
-                        ui.add_sized([55.0, 40.0], egui::Label::new(track.duration_label()));
+                            if ui
+                                .add_sized(
+                                    [210.0, 40.0],
+                                    egui::Button::new(track.display_title()).frame(false),
+                                )
+                                .clicked()
+                            {
+                                if !self.queue.contains(&path) {
+                                    self.queue.push(path.clone());
+                                }
+                                if let Some(index) =
+                                    self.queue.iter().position(|item| item == &path)
+                                {
+                                    self.play_queue_index(index);
+                                }
+                            }
+                            ui.add_sized([140.0, 40.0], egui::Label::new(&track.album_artist));
+                            ui.add_sized([150.0, 40.0], egui::Label::new(&track.album));
+                            ui.add_sized(
+                                [48.0, 40.0],
+                                egui::Label::new(
+                                    track.year.map(|year| year.to_string()).unwrap_or_default(),
+                                ),
+                            );
+                            ui.add_sized([58.0, 40.0], egui::Label::new(track.file_type()));
+                            ui.add_sized([55.0, 40.0], egui::Label::new(track.duration_label()));
+                        })
+                        .response
                     })
                     .response;
                 self.show_track_context_menu(&response, std::slice::from_ref(&path));
-                ui.separator();
             }
         });
     }
 
-    fn render_album_grid(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, tracks: &[Track]) {
-        let mut albums = std::collections::BTreeMap::<(String, String), Vec<Track>>::new();
+    fn render_album_grid(&mut self, ui: &mut egui::Ui, tracks: &[Track]) {
+        let mut albums = std::collections::BTreeMap::<(String, String), Vec<&Track>>::new();
         for track in tracks {
             albums
                 .entry((track.album_artist.clone(), track.album.clone()))
                 .or_default()
-                .push(track.clone());
+                .push(track);
         }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for ((artist, album), album_tracks) in albums {
-                    let Some(representative) = album_tracks.first() else {
-                        continue;
-                    };
-                    let artwork = representative.artwork_path.clone();
-                    let paths: Vec<PathBuf> = album_tracks
-                        .iter()
-                        .map(|track| track.path.clone())
-                        .collect();
-                    let texture = self.load_artwork(ctx, artwork.as_deref());
-                    let card = egui::Frame::group(ui.style())
-                        .show(ui, |ui| {
-                            ui.set_min_width(168.0);
-                            ui.set_max_width(168.0);
-                            if let Some(texture) = texture {
-                                ui.add(
-                                    egui::Image::from_texture(&texture)
-                                        .fit_to_exact_size(egui::vec2(144.0, 144.0)),
-                                );
-                            } else {
-                                ui.add_sized([144.0, 144.0], egui::Label::new("♫"));
-                            }
-                            ui.label(if album.is_empty() {
-                                "Unknown album"
-                            } else {
-                                &album
-                            });
-                            ui.label(if artist.is_empty() {
-                                "Unknown artist"
-                            } else {
-                                &artist
-                            });
-                            ui.label(format!("{} tracks", album_tracks.len()));
-                        })
-                        .response;
-                    let card = ui.interact(
-                        card.rect,
-                        ui.id().with(("album", &artist, &album)),
-                        egui::Sense::click(),
-                    );
-                    if card.clicked() {
-                        self.selected_paths.extend(paths.iter().cloned());
+        let albums: Vec<_> = albums.into_iter().collect();
+        let columns = ((ui.available_width() / 168.0).floor() as usize).max(1);
+        let rows = albums.len().div_ceil(columns);
+        egui::ScrollArea::vertical().show_rows(ui, 168.0, rows, |ui, row_range| {
+            for row in row_range {
+                ui.horizontal(|ui| {
+                    for column in 0..columns {
+                        let index = row * columns + column;
+                        let Some(((artist, album), album_tracks)) = albums.get(index) else {
+                            break;
+                        };
+                        let Some(representative) = album_tracks.first() else {
+                            continue;
+                        };
+                        let artwork = representative.artwork_path.clone();
+                        let paths: Vec<PathBuf> = album_tracks
+                            .iter()
+                            .map(|track| track.path.clone())
+                            .collect();
+                        let texture = self.load_artwork(artwork.as_deref());
+                        let artwork_failed = artwork
+                            .as_ref()
+                            .is_some_and(|path| self.artwork_failed.contains(path));
+                        let card = egui::Frame::group(ui.style())
+                            .show(ui, |ui| {
+                                ui.set_min_size(egui::vec2(152.0, 152.0));
+                                ui.set_max_size(egui::vec2(152.0, 152.0));
+                                if let Some(texture) = texture {
+                                    ui.add(
+                                        egui::Image::from_texture(&texture)
+                                            .fit_to_exact_size(egui::vec2(144.0, 144.0)),
+                                    );
+                                } else if artwork.is_some() && !artwork_failed {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label("…");
+                                    });
+                                } else {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(if album.is_empty() {
+                                            "Unknown album"
+                                        } else {
+                                            album
+                                        });
+                                    });
+                                }
+                            })
+                            .response;
+                        let card = ui.interact(
+                            card.rect,
+                            ui.id().with(("album", artist, album)),
+                            egui::Sense::click(),
+                        );
+                        if card.clicked() {
+                            self.selected_paths.extend(paths.iter().cloned());
+                        }
+                        self.show_track_context_menu(&card, &paths);
                     }
-                    self.show_track_context_menu(&card, &paths);
-                }
-            });
+                });
+            }
         });
     }
 
@@ -995,13 +1076,10 @@ impl MusicApp {
             .cloned()
             .collect();
         tracks.sort_by_cached_key(|track| {
-            let group = match self.organize_by.as_str() {
-                "Album" => track.album.to_lowercase(),
-                "Genre" => track.genre.to_lowercase(),
-                "Year" => track.year.map(|year| year.to_string()).unwrap_or_default(),
-                _ => track.album_artist.to_lowercase(),
-            };
-            (group, track.display_title().to_lowercase())
+            (
+                track_group_value(track, &self.organize_by).to_lowercase(),
+                track.display_title().to_lowercase(),
+            )
         });
         tracks
     }
@@ -1230,7 +1308,7 @@ impl MusicApp {
         ui.label("Equalizer changes apply to tracks started after adjusting them.");
     }
 
-    fn render_now_playing_cover(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+    fn render_now_playing_cover(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.heading("Now Playing");
             ui.add_space(12.0);
@@ -1239,7 +1317,7 @@ impl MusicApp {
                 .and_then(|index| self.queue.get(index))
                 .and_then(|path| self.data.tracks.iter().find(|track| &track.path == path))
                 .and_then(|track| track.artwork_path.clone());
-            if let Some(texture) = self.load_artwork(ctx, artwork_path.as_deref()) {
+            if let Some(texture) = self.load_artwork(artwork_path.as_deref()) {
                 let max_side = ui
                     .available_width()
                     .min(ui.available_height() * 0.75)
@@ -1269,6 +1347,7 @@ impl eframe::App for MusicApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_playback_end();
         self.finish_scan_if_ready();
+        self.finish_artwork_loads(ctx);
         egui::TopBottomPanel::top("navigation").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(format!("Fugue Jam · v{PROGRAM_VERSION}"));
@@ -1350,13 +1429,13 @@ impl eframe::App for MusicApp {
                     .resizable(true)
                     .default_width(available_width * self.now_playing_left_fraction)
                     .width_range(200.0..=available_width - 200.0)
-                    .show(ctx, |ui| self.render_now_playing_cover(ctx, ui));
+                    .show(ctx, |ui| self.render_now_playing_cover(ui));
                 self.now_playing_left_fraction =
                     (left.response.rect.width() / available_width).clamp(0.25, 0.9);
                 egui::CentralPanel::default().show(ctx, |ui| self.render_queue(ui));
             }
             Tab::Library => {
-                egui::CentralPanel::default().show(ctx, |ui| self.render_library(ctx, ui));
+                egui::CentralPanel::default().show(ctx, |ui| self.render_library(ui));
             }
             Tab::Playlists => {
                 egui::CentralPanel::default().show(ctx, |ui| self.render_playlists(ui));
@@ -1372,6 +1451,15 @@ impl eframe::App for MusicApp {
 fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+fn track_group_value(track: &Track, organize_by: &str) -> String {
+    match organize_by {
+        "Album" => track.album.clone(),
+        "Genre" => track.genre.clone(),
+        "Year" => track.year.map(|year| year.to_string()).unwrap_or_default(),
+        _ => track.album_artist.clone(),
+    }
 }
 
 fn collect_audio_files(
@@ -1398,21 +1486,35 @@ fn scan_folder(
     artwork_dir: &Path,
     progress: &AtomicUsize,
     total: &AtomicUsize,
-) -> Result<Vec<Track>, String> {
+    sender: &Sender<ScanMessage>,
+) -> Result<(), String> {
     let mut files = Vec::new();
     collect_audio_files(folder, recursive, &mut files).map_err(|error| error.to_string())?;
     files.sort();
     total.store(files.len(), Ordering::Relaxed);
+    sender
+        .send(ScanMessage::Total(files.len()))
+        .map_err(|error| error.to_string())?;
     fs::create_dir_all(artwork_dir).map_err(|error| error.to_string())?;
-    let tracks = files
-        .into_iter()
-        .map(|path| {
-            let track = read_track(&path, artwork_dir);
-            progress.fetch_add(1, Ordering::Relaxed);
-            track
-        })
-        .collect();
-    Ok(tracks)
+    for path in files {
+        let track = read_track(&path, artwork_dir);
+        progress.fetch_add(1, Ordering::Relaxed);
+        sender
+            .send(ScanMessage::Track(track))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn decode_artwork(path: &Path) -> Result<egui::ColorImage, String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let image = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
+    let thumbnail = image.thumbnail(640, 640).to_rgba8();
+    let size = [thumbnail.width() as usize, thumbnail.height() as usize];
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        thumbnail.as_raw(),
+    ))
 }
 
 fn is_supported_audio_file(path: &Path) -> bool {
@@ -1446,7 +1548,7 @@ fn read_track(path: &Path, artwork_dir: &Path) -> Track {
             .or_else(|| tag.pictures().first());
         if let Some(picture) = picture {
             let mut hasher = DefaultHasher::new();
-            path.hash(&mut hasher);
+            picture.data().hash(&mut hasher);
             let artwork_path = artwork_dir.join(format!("{:016x}.cover", hasher.finish()));
             if let Err(error) = fs::write(&artwork_path, picture.data()) {
                 eprintln!("Could not cache album art from {}: {error}", path.display());
@@ -1494,7 +1596,7 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_audio_files, is_supported_audio_file};
+    use super::{collect_audio_files, decode_artwork, is_supported_audio_file};
     use std::{
         fs,
         path::Path,
@@ -1532,5 +1634,26 @@ mod tests {
         assert_eq!(recursive.len(), 2);
 
         fs::remove_dir_all(root).expect("remove scan test folders");
+    }
+
+    #[test]
+    fn artwork_is_decoded_and_resized_for_thumbnails() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("fugue-jam-art-{}/{nonce}.png", std::process::id()));
+        fs::create_dir_all(path.parent().expect("artwork test parent"))
+            .expect("create artwork test folder");
+        image::RgbaImage::new(1200, 600)
+            .save(&path)
+            .expect("write test artwork");
+
+        let thumbnail = decode_artwork(&path).expect("decode test artwork");
+        assert_eq!(thumbnail.size, [640, 320]);
+
+        fs::remove_dir_all(path.parent().expect("artwork test parent"))
+            .expect("remove artwork test folder");
     }
 }

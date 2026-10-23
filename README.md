@@ -8,6 +8,7 @@ the user's application data directory.
 
 - Library browsing and search, with track and album-art grid views, organized by
   album artist, album, genre, or year
+- Background artwork loading and virtualized, vertically scrolling library views
 - Non-blocking library scanning with progress and recursive subfolder scanning
   enabled by default
 - Right-click selected library tracks to queue them or create/add to a static
