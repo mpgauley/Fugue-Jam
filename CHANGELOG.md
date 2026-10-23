@@ -5,6 +5,18 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 6
+
+- Made Library gallery cards fixed square tiles with a strict 1:1 aspect ratio.
+- Persisted the Now Playing queue in the saved library and restore it on the
+  next launch.
+- Removed per-track Remove buttons from the queue and added right-click actions
+  to remove, play next, move to the end, or add a track to a static playlist.
+- Added queue context-menu options to create a new playlist or choose an
+  existing static playlist.
+- Prevented queue rows from changing highlight color on mouse hover.
+- Made the Library central frame fill the available window width when opened.
+
 ## Version 5
 
 - Made equalizer adjustments, presets, and the enable toggle affect active

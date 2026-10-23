@@ -29,7 +29,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
 const EQ_FREQUENCIES: [f32; 5] = [60.0, 250.0, 1_000.0, 4_000.0, 12_000.0];
-const PROGRAM_VERSION: u32 = 5;
+const PROGRAM_VERSION: u32 = 6;
 
 struct EqualizerControls {
     gains: [AtomicU32; 5],
@@ -295,6 +295,8 @@ struct LibraryData {
     folders: Vec<PathBuf>,
     tracks: Vec<Track>,
     playlists: Vec<Playlist>,
+    #[serde(default)]
+    queue: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,6 +325,8 @@ struct MusicApp {
     selected_paths: HashSet<PathBuf>,
     queue: Vec<PathBuf>,
     queue_index: Option<usize>,
+    pending_queue_playlist: Option<PathBuf>,
+    new_queue_playlist_name: String,
     filter: String,
     organize_by: String,
     library_view: LibraryView,
@@ -399,6 +403,15 @@ struct GalleryItem {
 enum GalleryRow {
     Heading(String),
     Items(Vec<GalleryItem>),
+}
+
+#[derive(Clone, Copy)]
+enum QueueAction {
+    Remove,
+    PlayNext,
+    MoveToEnd,
+    AddToPlaylist(usize),
+    CreatePlaylist,
 }
 
 impl MusicApp {
@@ -505,11 +518,13 @@ impl MusicApp {
             .collect();
         Self {
             data_path,
+            queue: data.queue.clone(),
             data,
             tab: Tab::NowPlaying,
             selected_paths: HashSet::new(),
-            queue: Vec::new(),
             queue_index: None,
+            pending_queue_playlist: None,
+            new_queue_playlist_name: String::new(),
             filter: String::new(),
             organize_by: "Album Artist".to_owned(),
             library_view: LibraryView::Tracks,
@@ -549,6 +564,7 @@ impl MusicApp {
     }
 
     fn save(&mut self) {
+        self.data.queue.clone_from(&self.queue);
         let result = (|| -> Result<(), String> {
             if let Some(parent) = self.data_path.parent() {
                 fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -878,6 +894,7 @@ impl MusicApp {
         let count = selected.len();
         self.queue.extend(selected);
         self.status = format!("Added {count} selected track(s) to the queue.");
+        self.save();
     }
 
     fn play_selected_track(&mut self) {
@@ -887,6 +904,7 @@ impl MusicApp {
         };
         if !self.queue.contains(&path) {
             self.queue.push(path.clone());
+            self.save();
         }
         if let Some(index) = self.queue.iter().position(|queued| queued == &path) {
             self.play_queue_index(index);
@@ -927,6 +945,87 @@ impl MusicApp {
             "Added {count} playlist track(s) to the queue{}.",
             if random { " in random order" } else { "" }
         );
+        self.save();
+    }
+
+    fn remove_queue_track(&mut self, index: usize) {
+        if index >= self.queue.len() {
+            return;
+        }
+        if self.queue_index == Some(index) {
+            self.stop();
+            self.queue.remove(index);
+        } else {
+            self.queue.remove(index);
+            if self.queue_index.is_some_and(|current| index < current) {
+                self.queue_index = self.queue_index.map(|current| current - 1);
+            }
+        }
+        self.save();
+    }
+
+    fn play_queue_track_next(&mut self, index: usize) {
+        if index >= self.queue.len() || self.queue_index == Some(index) {
+            return;
+        }
+        let current_index = self.queue_index;
+        let track = self.queue.remove(index);
+        let current_after_removal = current_index.map(|current| {
+            if index < current {
+                current - 1
+            } else {
+                current
+            }
+        });
+        let insertion_index = current_after_removal.map_or(0, |current| current + 1);
+        self.queue.insert(insertion_index, track);
+        self.queue_index = current_after_removal.map(|current| {
+            if insertion_index <= current {
+                current + 1
+            } else {
+                current
+            }
+        });
+        self.save();
+    }
+
+    fn move_queue_track_to_end(&mut self, index: usize) {
+        if index >= self.queue.len() || index + 1 == self.queue.len() {
+            return;
+        }
+        let current_index = self.queue_index;
+        let track = self.queue.remove(index);
+        self.queue.push(track);
+        self.queue_index = current_index.map(|current| {
+            if index == current {
+                self.queue.len() - 1
+            } else if index < current {
+                current - 1
+            } else {
+                current
+            }
+        });
+        self.save();
+    }
+
+    fn add_queue_track_to_playlist(&mut self, path: &Path, playlist_index: usize) {
+        let Some(playlist) = self.data.playlists.get_mut(playlist_index) else {
+            self.status = "That playlist no longer exists.".to_owned();
+            return;
+        };
+        if playlist.smart.is_some() {
+            self.status = "Tracks can only be added to static playlists.".to_owned();
+            return;
+        }
+        let playlist_name = playlist.name.clone();
+        let path = path.to_path_buf();
+        if !playlist.tracks.contains(&path) {
+            playlist.tracks.push(path);
+            self.save();
+            self.status = format!("Added track to {playlist_name}.");
+        } else {
+            self.status = format!("Track is already in {playlist_name}.");
+        }
     }
 
     fn create_static_playlist(&mut self) {
@@ -1026,6 +1125,7 @@ impl MusicApp {
             .map(|track| format!("{} — {}", track.display_title(), track.album_artist))
             .unwrap_or_else(|| path.display().to_string());
         self.status = format!("Playing {}.", self.current_title);
+        self.save();
     }
 
     fn play_pause(&mut self) {
@@ -1068,6 +1168,7 @@ impl MusicApp {
         self.waveform.clear();
         self.waveform_track = None;
         self.status = "Playback stopped.".to_owned();
+        self.save();
     }
 
     fn next_track(&mut self) {
@@ -1305,7 +1406,7 @@ impl MusicApp {
         }
 
         let columns = ((ui.available_width() - ui.spacing().scroll.bar_width - 10.0)
-            / (self.thumbnail_size + 24.0))
+            / (self.thumbnail_size + ui.spacing().item_spacing.x))
             .floor()
             .max(1.0) as usize;
         let mut rows = Vec::new();
@@ -1321,7 +1422,7 @@ impl MusicApp {
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show_rows(
                 ui,
-                self.thumbnail_size + 32.0,
+                self.thumbnail_size + ui.spacing().item_spacing.y,
                 rows.len(),
                 |ui, row_range| {
                     for row_index in row_range {
@@ -1356,38 +1457,43 @@ impl MusicApp {
                                         } else {
                                             ui.visuals().widgets.noninteractive.bg_stroke
                                         };
-                                        let card = egui::Frame::group(ui.style())
-                                            .stroke(stroke)
-                                            .show(ui, |ui| {
-                                                ui.set_min_size(egui::vec2(size, size));
-                                                ui.set_max_size(egui::vec2(size, size));
-                                                if let Some(texture) = texture {
-                                                    ui.add(
-                                                        egui::Image::from_texture(&texture)
-                                                            .fit_to_exact_size(egui::vec2(
-                                                                size, size,
-                                                            )),
-                                                    );
-                                                } else if item.artwork_path.is_some()
-                                                    && !artwork_failed
-                                                {
-                                                    ui.centered_and_justified(|ui| {
-                                                        ui.label("…");
-                                                    });
+                                        let (rect, _allocated_response) = ui.allocate_exact_size(
+                                            egui::vec2(size, size),
+                                            egui::Sense::click(),
+                                        );
+                                        if let Some(texture) = texture {
+                                            ui.painter().image(
+                                                texture.id(),
+                                                rect.shrink(1.0),
+                                                egui::Rect::from_min_max(
+                                                    egui::Pos2::ZERO,
+                                                    egui::pos2(1.0, 1.0),
+                                                ),
+                                                egui::Color32::WHITE,
+                                            );
+                                        } else {
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                if item.artwork_path.is_some() && !artwork_failed {
+                                                    "…"
+                                                } else if item.label.is_empty() {
+                                                    "Unknown"
                                                 } else {
-                                                    ui.centered_and_justified(|ui| {
-                                                        ui.label(if item.label.is_empty() {
-                                                            "Unknown"
-                                                        } else {
-                                                            &item.label
-                                                        });
-                                                    });
-                                                }
-                                                ui.add_space((self.thumbnail_size - size).max(0.0));
-                                            })
-                                            .response;
+                                                    &item.label
+                                                },
+                                                egui::FontId::proportional(16.0),
+                                                ui.visuals().text_color(),
+                                            );
+                                        }
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            0.0,
+                                            stroke,
+                                            egui::StrokeKind::Inside,
+                                        );
                                         let card = ui.interact(
-                                            card.rect,
+                                            rect,
                                             ui.id().with((
                                                 "library-card",
                                                 &item.label,
@@ -1585,6 +1691,7 @@ impl MusicApp {
                         .clicked()
                     {
                         self.queue.push(path.clone());
+                        self.save();
                         self.play_queue_index(self.queue.len() - 1);
                     }
                 }
@@ -1611,10 +1718,19 @@ impl MusicApp {
                 if let Some(current) = current {
                     self.queue_index = self.queue.iter().position(|path| path == &current);
                 }
+                self.save();
             }
         });
         let queue = self.queue.clone();
-        let mut remove_index = None;
+        let static_playlists: Vec<(usize, String)> = self
+            .data
+            .playlists
+            .iter()
+            .enumerate()
+            .filter(|(_, playlist)| playlist.smart.is_none())
+            .map(|(index, playlist)| (index, playlist.name.clone()))
+            .collect();
+        let mut action = None;
         egui::ScrollArea::vertical()
             .max_height(420.0)
             .show(ui, |ui| {
@@ -1637,31 +1753,100 @@ impl MusicApp {
                         } else {
                             " "
                         };
-                        if ui
-                            .selectable_label(
-                                self.queue_index == Some(index),
-                                format!("{marker}  {title}"),
-                            )
-                            .clicked()
-                        {
+                        let response = ui.add(
+                            egui::Label::new(format!("{marker}  {title}"))
+                                .sense(egui::Sense::click()),
+                        );
+                        if response.clicked() {
                             self.play_queue_index(index);
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Remove").clicked() {
-                                remove_index = Some(index);
+                        response.context_menu(|ui| {
+                            if ui.button("Remove Track").clicked() {
+                                action = Some((index, QueueAction::Remove));
+                                ui.close_menu();
                             }
+                            if ui.button("Play Track Next").clicked() {
+                                action = Some((index, QueueAction::PlayNext));
+                                ui.close_menu();
+                            }
+                            if ui.button("Move Track to the End").clicked() {
+                                action = Some((index, QueueAction::MoveToEnd));
+                                ui.close_menu();
+                            }
+                            ui.menu_button("Add Track to Playlist…", |ui| {
+                                if ui.button("Create new playlist…").clicked() {
+                                    action = Some((index, QueueAction::CreatePlaylist));
+                                    ui.close_menu();
+                                }
+                                if static_playlists.is_empty() {
+                                    ui.label("No static playlists yet");
+                                }
+                                for (playlist_index, name) in &static_playlists {
+                                    if ui.button(name).clicked() {
+                                        action = Some((
+                                            index,
+                                            QueueAction::AddToPlaylist(*playlist_index),
+                                        ));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
                         });
                     });
                 }
             });
-        if let Some(index) = remove_index {
-            self.queue.remove(index);
-            if let Some(current) = self.queue_index {
-                if index == current {
-                    self.stop();
-                } else if index < current {
-                    self.queue_index = Some(current - 1);
+        if let Some((index, action)) = action {
+            match action {
+                QueueAction::Remove => self.remove_queue_track(index),
+                QueueAction::PlayNext => self.play_queue_track_next(index),
+                QueueAction::MoveToEnd => self.move_queue_track_to_end(index),
+                QueueAction::AddToPlaylist(playlist_index) => {
+                    if let Some(path) = queue.get(index) {
+                        self.add_queue_track_to_playlist(path, playlist_index);
+                    }
                 }
+                QueueAction::CreatePlaylist => {
+                    self.pending_queue_playlist = queue.get(index).cloned();
+                    self.new_queue_playlist_name.clear();
+                }
+            }
+        }
+        if let Some(path) = self.pending_queue_playlist.clone() {
+            let mut create = false;
+            let mut cancel = false;
+            egui::Window::new("Create playlist")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Create a static playlist with this track.");
+                    ui.text_edit_singleline(&mut self.new_queue_playlist_name);
+                    ui.horizontal(|ui| {
+                        if ui.button("Create").clicked() {
+                            create = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if create {
+                let name = self.new_queue_playlist_name.trim().to_owned();
+                if name.is_empty() {
+                    self.status = "Enter a name for the playlist.".to_owned();
+                } else {
+                    self.data.playlists.push(Playlist {
+                        name: name.clone(),
+                        tracks: vec![path],
+                        smart: None,
+                    });
+                    self.active_playlist = Some(self.data.playlists.len() - 1);
+                    self.save();
+                    self.status = format!("Created playlist “{name}”.");
+                    self.pending_queue_playlist = None;
+                }
+            }
+            if cancel {
+                self.pending_queue_playlist = None;
             }
         }
     }
@@ -1938,7 +2123,12 @@ impl eframe::App for MusicApp {
                 egui::CentralPanel::default().show(ctx, |ui| self.render_queue(ui));
             }
             Tab::Library => {
-                egui::CentralPanel::default().show(ctx, |ui| self.render_library(ui));
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.render_library(ui);
+                    });
             }
             Tab::Playlists => {
                 egui::CentralPanel::default().show(ctx, |ui| self.render_playlists(ui));
@@ -2225,8 +2415,8 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        LibraryView, Track, collect_audio_files, decode_artwork, gallery_items, is_in_scan_scope,
-        is_supported_audio_file, track_group_value,
+        LibraryData, LibraryView, Track, collect_audio_files, decode_artwork, gallery_items,
+        is_in_scan_scope, is_supported_audio_file, track_group_value,
     };
     use std::{
         fs,
@@ -2357,5 +2547,21 @@ mod tests {
             folder,
             true
         ));
+    }
+
+    #[test]
+    fn saved_library_defaults_and_round_trips_queue() {
+        let existing_library = r#"{"folders":[],"tracks":[],"playlists":[]}"#;
+        let mut library: LibraryData =
+            serde_json::from_str(existing_library).expect("load previous library format");
+        assert!(library.queue.is_empty());
+
+        library
+            .queue
+            .push(Path::new("/music/track.flac").to_path_buf());
+        let saved = serde_json::to_string(&library).expect("serialize library and queue");
+        let restored: LibraryData =
+            serde_json::from_str(&saved).expect("restore serialized library");
+        assert_eq!(restored.queue, library.queue);
     }
 }

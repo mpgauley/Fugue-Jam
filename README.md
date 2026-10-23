@@ -16,6 +16,9 @@ the user's application data directory.
   playlist
 - Persistent music folders, library metadata, static playlists, and smart playlists
 - Queue actions for selected library tracks and playlists, in regular or shuffled order
+- Persistent Now Playing queue restored when the app reopens
+- Queue context actions for removing, reordering, playing next, and adding tracks
+  to static playlists
 - Play, pause, stop, previous, and next controls
 - Waveform timeline with playback progress and click-to-seek controls
 - Five-band software equalizer with bass, treble, and vocal presets that apply
