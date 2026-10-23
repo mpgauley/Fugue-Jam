@@ -5,6 +5,15 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 10
+
+- Added **Customize display…** to the Now Playing queue, with selections for
+  title, artist, album artist, album, genre, year, track/disc number, composer,
+  and BPM tags.
+- Cached the selected metadata in queue entries so queue rows can display
+  chosen tags without searching the full library.
+- Reads the additional common ID tags when scanning supported audio files.
+
 ## Version 9
 
 - Added a Japanese-capable system font fallback through fontconfig for song

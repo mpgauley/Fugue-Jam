@@ -30,7 +30,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
 const EQ_BAND_COUNTS: [usize; 5] = [5, 8, 12, 20, 31];
-const PROGRAM_VERSION: u32 = 9;
+const PROGRAM_VERSION: u32 = 10;
 
 struct EqualizerControls {
     gains: [AtomicU32; 31],
@@ -254,10 +254,20 @@ impl Source for SilenceSource {
 struct Track {
     path: PathBuf,
     title: String,
+    #[serde(default)]
+    artist: String,
     album_artist: String,
     album: String,
     genre: String,
     year: Option<u32>,
+    #[serde(default)]
+    track_number: Option<String>,
+    #[serde(default)]
+    disc_number: Option<String>,
+    #[serde(default)]
+    composer: String,
+    #[serde(default)]
+    bpm: Option<String>,
     duration_secs: Option<u64>,
     #[serde(default)]
     artwork_path: Option<PathBuf>,
@@ -316,10 +326,20 @@ struct Playlist {
     smart: Option<(SmartField, String)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 struct QueueEntry {
     path: PathBuf,
     title: String,
+    artist: String,
+    album_artist: String,
+    album: String,
+    genre: String,
+    year: Option<u32>,
+    track_number: Option<String>,
+    disc_number: Option<String>,
+    composer: String,
+    bpm: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -338,16 +358,105 @@ where
         .into_iter()
         .map(|entry| match entry {
             StoredQueueEntry::Entry(entry) => entry,
-            StoredQueueEntry::Path(path) => QueueEntry {
-                title: path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("Unknown")
-                    .to_owned(),
-                path,
-            },
+            StoredQueueEntry::Path(path) => QueueEntry::from_path(path),
         })
         .collect())
+}
+
+impl QueueEntry {
+    fn from_path(path: PathBuf) -> Self {
+        let title = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("Unknown")
+            .to_owned();
+        Self {
+            path,
+            title,
+            ..Self::default()
+        }
+    }
+
+    fn from_track(track: &Track) -> Self {
+        Self {
+            path: track.path.clone(),
+            title: track.display_title().to_owned(),
+            artist: track.artist.clone(),
+            album_artist: track.album_artist.clone(),
+            album: track.album.clone(),
+            genre: track.genre.clone(),
+            year: track.year,
+            track_number: track.track_number.clone(),
+            disc_number: track.disc_number.clone(),
+            composer: track.composer.clone(),
+            bpm: track.bpm.clone(),
+        }
+    }
+
+    fn display_value(&self, field: QueueDisplayField) -> Option<String> {
+        let value = match field {
+            QueueDisplayField::Title => Some(self.title.clone()),
+            QueueDisplayField::Artist => Some(self.artist.clone()),
+            QueueDisplayField::AlbumArtist => Some(self.album_artist.clone()),
+            QueueDisplayField::Album => Some(self.album.clone()),
+            QueueDisplayField::Genre => Some(self.genre.clone()),
+            QueueDisplayField::Year => self.year.map(|year| year.to_string()),
+            QueueDisplayField::TrackNumber => self.track_number.clone(),
+            QueueDisplayField::DiscNumber => self.disc_number.clone(),
+            QueueDisplayField::Composer => Some(self.composer.clone()),
+            QueueDisplayField::Bpm => self.bpm.clone(),
+        }?;
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum QueueDisplayField {
+    Title,
+    Artist,
+    AlbumArtist,
+    Album,
+    Genre,
+    Year,
+    TrackNumber,
+    DiscNumber,
+    Composer,
+    Bpm,
+}
+
+impl QueueDisplayField {
+    const ALL: [Self; 10] = [
+        Self::Title,
+        Self::Artist,
+        Self::AlbumArtist,
+        Self::Album,
+        Self::Genre,
+        Self::Year,
+        Self::TrackNumber,
+        Self::DiscNumber,
+        Self::Composer,
+        Self::Bpm,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::Artist => "Artist",
+            Self::AlbumArtist => "Album artist",
+            Self::Album => "Album",
+            Self::Genre => "Genre",
+            Self::Year => "Year",
+            Self::TrackNumber => "Track number",
+            Self::DiscNumber => "Disc number",
+            Self::Composer => "Composer",
+            Self::Bpm => "BPM",
+        }
+    }
+}
+
+fn default_queue_display_fields() -> Vec<QueueDisplayField> {
+    vec![QueueDisplayField::Title]
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -357,6 +466,8 @@ struct LibraryData {
     playlists: Vec<Playlist>,
     #[serde(default, deserialize_with = "deserialize_queue")]
     queue: Vec<QueueEntry>,
+    #[serde(default = "default_queue_display_fields")]
+    queue_display_fields: Vec<QueueDisplayField>,
     #[serde(default)]
     library_view: LibraryView,
     #[serde(default = "default_eq_band_count")]
@@ -376,6 +487,7 @@ impl Default for LibraryData {
             tracks: Vec::new(),
             playlists: Vec::new(),
             queue: Vec::new(),
+            queue_display_fields: default_queue_display_fields(),
             library_view: LibraryView::default(),
             eq_band_count: default_eq_band_count(),
             eq_bands: Vec::new(),
@@ -412,6 +524,7 @@ struct MusicApp {
     queue_index: Option<usize>,
     pending_queue_playlist: Option<PathBuf>,
     new_queue_playlist_name: String,
+    show_queue_display_options: bool,
     filter: String,
     organize_by: String,
     library_view: LibraryView,
@@ -700,7 +813,7 @@ impl MusicApp {
                 .get(&entry.path)
                 .and_then(|index| data.tracks.get(*index))
             {
-                entry.title = track.display_title().to_owned();
+                *entry = QueueEntry::from_track(track);
             }
         }
         let library_view = data.library_view;
@@ -708,6 +821,9 @@ impl MusicApp {
         let eq_band_count = data.eq_band_count;
         let eq_enabled = data.eq_enabled;
         let now_playing_left_fraction = data.now_playing_left_fraction;
+        if data.queue_display_fields.is_empty() {
+            data.queue_display_fields = default_queue_display_fields();
+        }
         Self {
             data_path,
             data,
@@ -716,6 +832,7 @@ impl MusicApp {
             queue_index: None,
             pending_queue_playlist: None,
             new_queue_playlist_name: String::new(),
+            show_queue_display_options: false,
             filter: String::new(),
             organize_by: "Album Artist".to_owned(),
             library_view,
@@ -857,7 +974,7 @@ impl MusicApp {
                         .iter_mut()
                         .filter(|entry| entry.path == track.path)
                     {
-                        entry.title = track.display_title().to_owned();
+                        *entry = QueueEntry::from_track(&track);
                     }
                     if let Some(index) = self.library_indices.get(&track.path).copied() {
                         self.data.tracks[index] = track;
@@ -992,18 +1109,11 @@ impl MusicApp {
     }
 
     fn queue_entry(&self, path: PathBuf) -> QueueEntry {
-        let title = self
-            .library_indices
+        self.library_indices
             .get(&path)
             .and_then(|index| self.data.tracks.get(*index))
-            .map(|track| track.display_title().to_owned())
-            .or_else(|| {
-                path.file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| "Unknown".to_owned());
-        QueueEntry { path, title }
+            .map(QueueEntry::from_track)
+            .unwrap_or_else(|| QueueEntry::from_path(path))
     }
 
     fn finish_waveform_loads(&mut self) {
@@ -1963,6 +2073,9 @@ impl MusicApp {
                 }
                 self.save();
             }
+            if ui.button("Customize display…").clicked() {
+                self.show_queue_display_options = true;
+            }
         });
         let static_playlists: Vec<(usize, String)> = self
             .data
@@ -1974,12 +2087,22 @@ impl MusicApp {
             .collect();
         let mut action = None;
         let mut play_index = None;
+        let queue_display_fields = self.data.queue_display_fields.clone();
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_height, self.data.queue.len(), |ui, rows| {
                 for index in rows {
-                    let title = &self.data.queue[index].title;
+                    let entry = &self.data.queue[index];
+                    let values: Vec<String> = queue_display_fields
+                        .iter()
+                        .filter_map(|field| entry.display_value(*field))
+                        .collect();
+                    let title = if values.is_empty() {
+                        entry.title.as_str().to_owned()
+                    } else {
+                        values.join(" — ")
+                    };
                     let marker = if self.queue_index == Some(index) {
                         "▶"
                     } else {
@@ -2024,6 +2147,32 @@ impl MusicApp {
                     });
                 }
             });
+        if self.show_queue_display_options {
+            let mut selected: Vec<bool> = QueueDisplayField::ALL
+                .iter()
+                .map(|field| self.data.queue_display_fields.contains(field))
+                .collect();
+            let mut display_changed = false;
+            egui::Window::new("Customize queue display")
+                .open(&mut self.show_queue_display_options)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Select the ID tags to show for each queued track.");
+                    for (index, field) in QueueDisplayField::ALL.iter().enumerate() {
+                        display_changed |=
+                            ui.checkbox(&mut selected[index], field.label()).changed();
+                    }
+                    ui.label("When no selected tag has a value, the title is shown.");
+                });
+            if display_changed {
+                self.data.queue_display_fields = QueueDisplayField::ALL
+                    .iter()
+                    .zip(selected)
+                    .filter_map(|(field, selected)| selected.then_some(*field))
+                    .collect();
+                self.save();
+            }
+        }
         if let Some(index) = play_index {
             self.play_queue_index(index);
         }
@@ -2668,11 +2817,16 @@ fn read_track(path: &Path, artwork_dir: &Path) -> Track {
             .title()
             .map(|value| value.to_string())
             .unwrap_or(track.title);
-        track.album_artist = tag
-            .get_string(&lofty::tag::ItemKey::AlbumArtist)
+        track.artist = tag
+            .get_string(&lofty::tag::ItemKey::TrackArtist)
             .map(str::to_owned)
             .or_else(|| tag.artist().map(|value| value.into_owned()))
             .unwrap_or_default();
+        track.album_artist = tag
+            .get_string(&lofty::tag::ItemKey::AlbumArtist)
+            .map(str::to_owned)
+            .filter(|artist| !artist.is_empty())
+            .unwrap_or_else(|| track.artist.clone());
         track.album = tag
             .album()
             .map(|value| value.into_owned())
@@ -2682,6 +2836,20 @@ fn read_track(path: &Path, artwork_dir: &Path) -> Track {
             .map(|value| value.into_owned())
             .unwrap_or_default();
         track.year = tag.year();
+        track.track_number = tag
+            .get_string(&lofty::tag::ItemKey::TrackNumber)
+            .map(str::to_owned);
+        track.disc_number = tag
+            .get_string(&lofty::tag::ItemKey::DiscNumber)
+            .map(str::to_owned);
+        track.composer = tag
+            .get_string(&lofty::tag::ItemKey::Composer)
+            .unwrap_or_default()
+            .to_owned();
+        track.bpm = tag
+            .get_string(&lofty::tag::ItemKey::Bpm)
+            .or_else(|| tag.get_string(&lofty::tag::ItemKey::IntegerBpm))
+            .map(str::to_owned);
     }
     track
 }
@@ -2747,9 +2915,9 @@ fn install_japanese_font_fallback(ctx: &egui::Context) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EQ_BAND_COUNTS, LibraryData, LibraryView, QueueEntry, Track, available_library_view,
-        collect_audio_files, decode_artwork, eq_frequencies, gallery_items, is_in_scan_scope,
-        is_supported_audio_file, remap_eq_gains, track_group_value,
+        EQ_BAND_COUNTS, LibraryData, LibraryView, QueueDisplayField, QueueEntry, Track,
+        available_library_view, collect_audio_files, decode_artwork, eq_frequencies, gallery_items,
+        is_in_scan_scope, is_supported_audio_file, remap_eq_gains, track_group_value,
     };
     use std::{
         fs,
@@ -2888,6 +3056,7 @@ mod tests {
         let mut library: LibraryData =
             serde_json::from_str(existing_library).expect("load previous library format");
         assert!(library.queue.is_empty());
+        assert_eq!(library.queue_display_fields, vec![QueueDisplayField::Title]);
 
         let old_queue_library =
             r#"{"folders":[],"tracks":[],"playlists":[],"queue":["/music/track.flac"]}"#;
@@ -2899,12 +3068,44 @@ mod tests {
         library.queue.push(QueueEntry {
             path: Path::new("/music/track.flac").to_path_buf(),
             title: "Tagged title".to_owned(),
+            ..QueueEntry::default()
         });
         let saved = serde_json::to_string(&library).expect("serialize library and queue");
         let restored: LibraryData =
             serde_json::from_str(&saved).expect("restore serialized library");
         assert_eq!(restored.queue[0].path, library.queue[0].path);
         assert_eq!(restored.queue[0].title, "Tagged title");
+    }
+
+    #[test]
+    fn queue_display_fields_show_selected_common_tags() {
+        let entry = QueueEntry {
+            title: "Song".to_owned(),
+            artist: "Artist".to_owned(),
+            album: "Album".to_owned(),
+            year: Some(2024),
+            track_number: Some("7".to_owned()),
+            ..QueueEntry::default()
+        };
+        assert_eq!(
+            entry.display_value(QueueDisplayField::Title).as_deref(),
+            Some("Song")
+        );
+        assert_eq!(
+            entry.display_value(QueueDisplayField::Artist).as_deref(),
+            Some("Artist")
+        );
+        assert_eq!(
+            entry.display_value(QueueDisplayField::Year).as_deref(),
+            Some("2024")
+        );
+        assert_eq!(
+            entry
+                .display_value(QueueDisplayField::TrackNumber)
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(entry.display_value(QueueDisplayField::Composer), None);
     }
 
     #[test]
@@ -2928,6 +3129,7 @@ mod tests {
     fn saved_view_and_equalizer_settings_round_trip() {
         let library = LibraryData {
             library_view: LibraryView::Album,
+            queue_display_fields: vec![QueueDisplayField::Artist, QueueDisplayField::Album],
             eq_band_count: 8,
             eq_bands: vec![1.0; 8],
             eq_enabled: false,
@@ -2938,6 +3140,10 @@ mod tests {
         let restored: LibraryData =
             serde_json::from_str(&serialized).expect("restore player settings");
         assert_eq!(restored.library_view, LibraryView::Album);
+        assert_eq!(
+            restored.queue_display_fields,
+            vec![QueueDisplayField::Artist, QueueDisplayField::Album]
+        );
         assert_eq!(restored.eq_band_count, 8);
         assert_eq!(restored.eq_bands, vec![1.0; 8]);
         assert!(!restored.eq_enabled);
