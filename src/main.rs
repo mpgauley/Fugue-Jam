@@ -28,37 +28,46 @@ use serde::{Deserialize, Serialize};
 const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
-const EQ_FREQUENCIES: [f32; 5] = [60.0, 250.0, 1_000.0, 4_000.0, 12_000.0];
-const PROGRAM_VERSION: u32 = 6;
+const EQ_BAND_COUNTS: [usize; 5] = [5, 8, 12, 20, 31];
+const PROGRAM_VERSION: u32 = 7;
 
 struct EqualizerControls {
-    gains: [AtomicU32; 5],
+    gains: [AtomicU32; 31],
+    band_count: AtomicU32,
     enabled: AtomicBool,
     revision: AtomicU64,
 }
 
 impl EqualizerControls {
-    fn new(gains: [f32; 5], enabled: bool) -> Self {
+    fn new(gains: &[f32], enabled: bool) -> Self {
+        let mut initial_gains = [0.0; 31];
+        let count = gains.len().min(initial_gains.len());
+        initial_gains[..count].copy_from_slice(&gains[..count]);
         Self {
-            gains: gains.map(|gain| AtomicU32::new(gain.to_bits())),
+            gains: std::array::from_fn(|index| AtomicU32::new(initial_gains[index].to_bits())),
+            band_count: AtomicU32::new(gains.len() as u32),
             enabled: AtomicBool::new(enabled),
             revision: AtomicU64::new(0),
         }
     }
 
-    fn update(&self, gains: &[f32; 5], enabled: bool) {
+    fn update(&self, gains: &[f32], enabled: bool) {
         for (target, gain) in self.gains.iter().zip(gains) {
             target.store(gain.to_bits(), Ordering::Relaxed);
         }
+        self.band_count.store(gains.len() as u32, Ordering::Relaxed);
         self.enabled.store(enabled, Ordering::Relaxed);
         self.revision.fetch_add(1, Ordering::Release);
     }
 
-    fn snapshot(&self) -> ([f32; 5], bool) {
+    fn snapshot(&self) -> (Vec<f32>, bool) {
+        let count = (self.band_count.load(Ordering::Relaxed) as usize).clamp(5, 31);
         (
             self.gains
-                .each_ref()
-                .map(|gain| f32::from_bits(gain.load(Ordering::Relaxed))),
+                .iter()
+                .take(count)
+                .map(|gain| f32::from_bits(gain.load(Ordering::Relaxed)))
+                .collect(),
             self.enabled.load(Ordering::Relaxed),
         )
     }
@@ -124,10 +133,11 @@ impl<S: Source<Item = f32>> EqualizedSource<S> {
     fn new(input: S, controls: Arc<EqualizerControls>) -> Self {
         let channels = input.channels().max(1) as usize;
         let (bands, enabled) = controls.snapshot();
-        let filters = EQ_FREQUENCIES
+        let frequencies = eq_frequencies(bands.len());
+        let filters = frequencies
             .iter()
-            .zip(bands)
-            .map(|(&frequency, gain)| {
+            .zip(&bands)
+            .map(|(&frequency, &gain)| {
                 Biquad::peaking(
                     frequency,
                     if enabled { gain } else { 0.0 },
@@ -156,16 +166,31 @@ impl<S: Source<Item = f32>> Iterator for EqualizedSource<S> {
             let revision = self.controls.revision.load(Ordering::Acquire);
             if revision != self.revision {
                 let (bands, enabled) = self.controls.snapshot();
-                for (filter, (&frequency, gain)) in self
-                    .filters
-                    .iter_mut()
-                    .zip(EQ_FREQUENCIES.iter().zip(bands))
-                {
-                    filter.set_gain(
-                        frequency,
-                        if enabled { gain } else { 0.0 },
-                        self.input.sample_rate(),
-                    );
+                let frequencies = eq_frequencies(bands.len());
+                if frequencies.len() != self.filters.len() {
+                    let channels = self.channels as u16;
+                    self.filters = frequencies
+                        .iter()
+                        .zip(&bands)
+                        .map(|(&frequency, &gain)| {
+                            Biquad::peaking(
+                                frequency,
+                                if enabled { gain } else { 0.0 },
+                                self.input.sample_rate(),
+                                channels,
+                            )
+                        })
+                        .collect();
+                } else {
+                    for ((filter, &frequency), &gain) in
+                        self.filters.iter_mut().zip(&frequencies).zip(&bands)
+                    {
+                        filter.set_gain(
+                            frequency,
+                            if enabled { gain } else { 0.0 },
+                            self.input.sample_rate(),
+                        );
+                    }
                 }
                 self.revision = revision;
             }
@@ -290,13 +315,39 @@ struct Playlist {
     smart: Option<(SmartField, String)>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct LibraryData {
     folders: Vec<PathBuf>,
     tracks: Vec<Track>,
     playlists: Vec<Playlist>,
     #[serde(default)]
     queue: Vec<PathBuf>,
+    #[serde(default)]
+    library_view: LibraryView,
+    #[serde(default = "default_eq_band_count")]
+    eq_band_count: usize,
+    #[serde(default)]
+    eq_bands: Vec<f32>,
+    #[serde(default = "default_eq_enabled")]
+    eq_enabled: bool,
+    #[serde(default = "default_now_playing_left_fraction")]
+    now_playing_left_fraction: f32,
+}
+
+impl Default for LibraryData {
+    fn default() -> Self {
+        Self {
+            folders: Vec::new(),
+            tracks: Vec::new(),
+            playlists: Vec::new(),
+            queue: Vec::new(),
+            library_view: LibraryView::default(),
+            eq_band_count: default_eq_band_count(),
+            eq_bands: Vec::new(),
+            eq_enabled: default_eq_enabled(),
+            now_playing_left_fraction: default_now_playing_left_fraction(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,7 +396,8 @@ struct MusicApp {
     paused: bool,
     current_title: String,
     track_duration: Option<Duration>,
-    eq_bands: [f32; 5],
+    eq_bands: Vec<f32>,
+    eq_band_count: usize,
     eq_enabled: bool,
     eq_preset: usize,
     eq_controls: Arc<EqualizerControls>,
@@ -382,11 +434,89 @@ enum ScanMessage {
     Finished(Result<(), String>),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum LibraryView {
     Album,
     AlbumArtist,
+    #[default]
     Tracks,
+}
+
+fn default_eq_band_count() -> usize {
+    5
+}
+
+fn default_eq_enabled() -> bool {
+    true
+}
+
+fn default_now_playing_left_fraction() -> f32 {
+    0.75
+}
+
+fn supported_eq_band_count(count: usize) -> usize {
+    if EQ_BAND_COUNTS.contains(&count) {
+        count
+    } else {
+        5
+    }
+}
+
+fn eq_frequencies(count: usize) -> Vec<f32> {
+    if count == 5 {
+        return vec![60.0, 250.0, 1_000.0, 4_000.0, 12_000.0];
+    }
+    let (minimum, maximum): (f32, f32) = if count == 8 {
+        (30.0, 18_000.0)
+    } else {
+        (20.0, 20_000.0)
+    };
+    (0..count)
+        .map(|index| {
+            let fraction = index as f32 / (count - 1) as f32;
+            minimum * (maximum / minimum).powf(fraction)
+        })
+        .collect()
+}
+
+fn interpolate_gain(frequency: f32, source_frequencies: &[f32], gains: &[f32]) -> f32 {
+    if frequency <= source_frequencies[0] {
+        return gains[0];
+    }
+    if frequency >= *source_frequencies.last().unwrap_or(&frequency) {
+        return *gains.last().unwrap_or(&0.0);
+    }
+    let upper = source_frequencies
+        .iter()
+        .position(|source| *source >= frequency)
+        .unwrap_or(source_frequencies.len() - 1);
+    let lower = upper - 1;
+    let low_log = source_frequencies[lower].ln();
+    let high_log = source_frequencies[upper].ln();
+    let amount = (frequency.ln() - low_log) / (high_log - low_log);
+    gains[lower] + (gains[upper] - gains[lower]) * amount
+}
+
+fn remap_eq_gains(gains: &[f32], target_count: usize) -> Vec<f32> {
+    let source_frequencies = eq_frequencies(gains.len());
+    eq_frequencies(target_count)
+        .iter()
+        .map(|frequency| interpolate_gain(*frequency, &source_frequencies, gains))
+        .collect()
+}
+
+fn preset_eq_gains(preset: usize, count: usize) -> Vec<f32> {
+    let anchors = match preset {
+        2 => [6.0, 4.0, 0.0, -1.0, 0.0],
+        3 => [0.0, -1.0, 0.0, 4.0, 6.0],
+        4 => [-2.0, 1.0, 4.0, 2.0, -1.0],
+        _ => [0.0; 5],
+    };
+    if count == 5 {
+        anchors.to_vec()
+    } else {
+        remap_eq_gains(&anchors, count)
+    }
 }
 
 #[derive(Clone)]
@@ -419,7 +549,7 @@ impl MusicApp {
         let data_path = directories::ProjectDirs::from("org", "FugueJam", "Fugue Jam")
             .map(|dirs| dirs.data_dir().join("library.json"))
             .unwrap_or_else(|| PathBuf::from("fugue-jam-library.json"));
-        let (data, mut status) = match fs::read(&data_path) {
+        let (mut data, mut status) = match fs::read(&data_path) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(data) => (data, "Library loaded.".to_owned()),
                 Err(error) => (
@@ -436,6 +566,13 @@ impl MusicApp {
                 format!("Could not open the saved library: {error}"),
             ),
         };
+        data.eq_band_count = supported_eq_band_count(data.eq_band_count);
+        data.eq_bands.resize(data.eq_band_count, 0.0);
+        data.eq_bands.truncate(data.eq_band_count);
+        data.eq_bands
+            .iter_mut()
+            .for_each(|gain| *gain = gain.clamp(-12.0, 12.0));
+        data.now_playing_left_fraction = data.now_playing_left_fraction.clamp(0.25, 0.9);
         let output_device_name = cpal::default_host()
             .default_output_device()
             .and_then(|device| match device.name() {
@@ -509,13 +646,18 @@ impl MusicApp {
                 }
             }
         });
-        let eq_controls = Arc::new(EqualizerControls::new([0.0; 5], true));
+        let eq_controls = Arc::new(EqualizerControls::new(&data.eq_bands, data.eq_enabled));
         let library_indices = data
             .tracks
             .iter()
             .enumerate()
             .map(|(index, track)| (track.path.clone(), index))
             .collect();
+        let library_view = data.library_view;
+        let eq_bands = data.eq_bands.clone();
+        let eq_band_count = data.eq_band_count;
+        let eq_enabled = data.eq_enabled;
+        let now_playing_left_fraction = data.now_playing_left_fraction;
         Self {
             data_path,
             queue: data.queue.clone(),
@@ -527,7 +669,7 @@ impl MusicApp {
             new_queue_playlist_name: String::new(),
             filter: String::new(),
             organize_by: "Album Artist".to_owned(),
-            library_view: LibraryView::Tracks,
+            library_view,
             sort_by: "Album Name".to_owned(),
             thumbnail_size: 144.0,
             active_playlist: None,
@@ -543,8 +685,9 @@ impl MusicApp {
             paused: false,
             current_title: String::new(),
             track_duration: None,
-            eq_bands: [0.0; 5],
-            eq_enabled: true,
+            eq_bands,
+            eq_band_count,
+            eq_enabled,
             eq_preset: 0,
             eq_controls,
             waveform: Vec::new(),
@@ -559,12 +702,17 @@ impl MusicApp {
             artwork_pending: HashSet::new(),
             artwork_failed: HashSet::new(),
             library_indices,
-            now_playing_left_fraction: 0.75,
+            now_playing_left_fraction,
         }
     }
 
     fn save(&mut self) {
         self.data.queue.clone_from(&self.queue);
+        self.data.library_view = self.library_view;
+        self.data.eq_band_count = self.eq_band_count;
+        self.data.eq_bands.clone_from(&self.eq_bands);
+        self.data.eq_enabled = self.eq_enabled;
+        self.data.now_playing_left_fraction = self.now_playing_left_fraction;
         let result = (|| -> Result<(), String> {
             if let Some(parent) = self.data_path.parent() {
                 fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -1204,6 +1352,7 @@ impl MusicApp {
     }
 
     fn render_library(&mut self, ui: &mut egui::Ui) {
+        let previous_library_view = self.library_view;
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -1293,6 +1442,9 @@ impl MusicApp {
                 self.selected_paths.clear();
             }
         });
+        if self.library_view != previous_library_view {
+            self.save();
+        }
         let tracks = self.visible_tracks();
         if tracks.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -1853,10 +2005,24 @@ impl MusicApp {
 
     fn render_equalization(&mut self, ui: &mut egui::Ui) {
         ui.heading("Equalization");
-        ui.label("Five-band equalizer controls");
+        ui.label(format!("{}-band equalizer controls", self.eq_band_count));
         let mut controls_changed = ui
             .checkbox(&mut self.eq_enabled, "Enable equalizer")
             .changed();
+        egui::ComboBox::from_id_salt("eq_band_count")
+            .selected_text(format!("{} bands", self.eq_band_count))
+            .show_ui(ui, |ui| {
+                for count in EQ_BAND_COUNTS {
+                    if ui
+                        .selectable_value(&mut self.eq_band_count, count, format!("{count} bands"))
+                        .clicked()
+                    {
+                        self.eq_bands = remap_eq_gains(&self.eq_bands, count);
+                        self.eq_preset = 0;
+                        controls_changed = true;
+                    }
+                }
+            });
         let presets = ["Custom", "Flat", "Bass boost", "Treble boost", "Vocal"];
         egui::ComboBox::from_id_salt("eq_preset")
             .selected_text(presets[self.eq_preset.min(presets.len() - 1)])
@@ -1867,36 +2033,32 @@ impl MusicApp {
                         .clicked()
                     {
                         controls_changed = true;
-                        self.eq_bands = match index {
-                            1 => [0.0; 5],
-                            2 => [6.0, 4.0, 0.0, -1.0, 0.0],
-                            3 => [0.0, -1.0, 0.0, 4.0, 6.0],
-                            4 => [-2.0, 1.0, 4.0, 2.0, -1.0],
-                            _ => self.eq_bands,
-                        };
+                        if index > 0 {
+                            self.eq_bands = preset_eq_gains(index, self.eq_band_count);
+                        }
                     }
                 }
             });
         ui.add_space(16.0);
         let mut eq_changed = false;
-        ui.horizontal(|ui| {
-            for (index, label) in ["60 Hz", "250 Hz", "1 kHz", "4 kHz", "12 kHz"]
-                .iter()
-                .enumerate()
-            {
-                ui.vertical(|ui| {
-                    ui.label(*label);
-                    eq_changed |= ui
-                        .add_enabled(
-                            self.eq_enabled,
-                            egui::Slider::new(&mut self.eq_bands[index], -12.0..=12.0)
-                                .vertical()
-                                .show_value(true)
-                                .suffix(" dB"),
-                        )
-                        .changed();
-                });
-            }
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (index, frequency) in eq_frequencies(self.eq_band_count).iter().enumerate() {
+                    let label = format_frequency(*frequency);
+                    ui.vertical(|ui| {
+                        ui.label(label);
+                        eq_changed |= ui
+                            .add_enabled(
+                                self.eq_enabled,
+                                egui::Slider::new(&mut self.eq_bands[index], -12.0..=12.0)
+                                    .vertical()
+                                    .show_value(true)
+                                    .suffix(" dB"),
+                            )
+                            .changed();
+                    });
+                }
+            });
         });
         if eq_changed {
             self.eq_preset = 0;
@@ -1904,8 +2066,10 @@ impl MusicApp {
         }
         if controls_changed {
             self.eq_controls.update(&self.eq_bands, self.eq_enabled);
+            self.save();
         }
         ui.separator();
+        ui.label("Frequency range: 60 Hz–12 kHz for 5 bands; 30 Hz–18 kHz for 8 bands; 20 Hz–20 kHz for 12–31 bands.");
         ui.label("Equalizer changes apply immediately during playback.");
     }
 
@@ -2112,15 +2276,46 @@ impl eframe::App for MusicApp {
             });
         match self.tab {
             Tab::NowPlaying => {
-                let available_width = ctx.available_rect().width();
-                let left = egui::SidePanel::left("now_playing_cover")
-                    .resizable(true)
-                    .default_width(available_width * self.now_playing_left_fraction)
-                    .width_range(200.0..=available_width - 200.0)
-                    .show(ctx, |ui| self.render_now_playing_cover(ui));
-                self.now_playing_left_fraction =
-                    (left.response.rect.width() / available_width).clamp(0.25, 0.9);
-                egui::CentralPanel::default().show(ctx, |ui| self.render_queue(ui));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let available = ui.available_size();
+                    let divider_width = 6.0;
+                    let content_width = (available.x - divider_width).max(0.0);
+                    let left_width = content_width * self.now_playing_left_fraction;
+                    let split_left = ui.min_rect().left();
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(left_width, available.y),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| self.render_now_playing_cover(ui),
+                        );
+                        let (divider_rect, divider_response) = ui.allocate_exact_size(
+                            egui::vec2(divider_width, available.y),
+                            egui::Sense::drag(),
+                        );
+                        ui.painter().rect_filled(
+                            divider_rect.shrink2(egui::vec2(2.0, 0.0)),
+                            1.0,
+                            ui.visuals().widgets.noninteractive.bg_stroke.color,
+                        );
+                        if divider_response.dragged()
+                            && let Some(pointer) = divider_response.interact_pointer_pos()
+                        {
+                            self.now_playing_left_fraction =
+                                ((pointer.x - split_left - divider_width * 0.5)
+                                    / content_width.max(1.0))
+                                .clamp(0.25, 0.9);
+                        }
+                        if divider_response.drag_stopped() {
+                            self.save();
+                        }
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(content_width - left_width, available.y),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| self.render_queue(ui),
+                        );
+                    });
+                });
             }
             Tab::Library => {
                 egui::CentralPanel::default()
@@ -2144,6 +2339,14 @@ impl eframe::App for MusicApp {
 fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+fn format_frequency(frequency: f32) -> String {
+    if frequency >= 1_000.0 {
+        format!("{:.1} kHz", frequency / 1_000.0)
+    } else {
+        format!("{frequency:.0} Hz")
+    }
 }
 
 fn is_in_scan_scope(path: &Path, folder: &Path, recursive: bool) -> bool {
@@ -2415,8 +2618,9 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        LibraryData, LibraryView, Track, collect_audio_files, decode_artwork, gallery_items,
-        is_in_scan_scope, is_supported_audio_file, track_group_value,
+        EQ_BAND_COUNTS, LibraryData, LibraryView, Track, collect_audio_files, decode_artwork,
+        eq_frequencies, gallery_items, is_in_scan_scope, is_supported_audio_file, remap_eq_gains,
+        track_group_value,
     };
     use std::{
         fs,
@@ -2563,5 +2767,42 @@ mod tests {
         let restored: LibraryData =
             serde_json::from_str(&saved).expect("restore serialized library");
         assert_eq!(restored.queue, library.queue);
+    }
+
+    #[test]
+    fn equalizer_band_options_use_expected_frequency_ranges() {
+        assert_eq!(EQ_BAND_COUNTS, [5, 8, 12, 20, 31]);
+        for count in EQ_BAND_COUNTS {
+            assert_eq!(eq_frequencies(count).len(), count);
+        }
+        assert_eq!(eq_frequencies(5).first(), Some(&60.0));
+        assert_eq!(eq_frequencies(5).last(), Some(&12_000.0));
+        assert_eq!(eq_frequencies(8).first(), Some(&30.0));
+        assert_eq!(eq_frequencies(8).last(), Some(&18_000.0));
+        for count in [12, 20, 31] {
+            assert_eq!(eq_frequencies(count).first(), Some(&20.0));
+            assert_eq!(eq_frequencies(count).last(), Some(&20_000.0));
+        }
+        assert_eq!(remap_eq_gains(&[0.0; 5], 31), vec![0.0; 31]);
+    }
+
+    #[test]
+    fn saved_view_and_equalizer_settings_round_trip() {
+        let library = LibraryData {
+            library_view: LibraryView::Album,
+            eq_band_count: 8,
+            eq_bands: vec![1.0; 8],
+            eq_enabled: false,
+            now_playing_left_fraction: 0.6,
+            ..LibraryData::default()
+        };
+        let serialized = serde_json::to_string(&library).expect("serialize player settings");
+        let restored: LibraryData =
+            serde_json::from_str(&serialized).expect("restore player settings");
+        assert_eq!(restored.library_view, LibraryView::Album);
+        assert_eq!(restored.eq_band_count, 8);
+        assert_eq!(restored.eq_bands, vec![1.0; 8]);
+        assert!(!restored.eq_enabled);
+        assert!((restored.now_playing_left_fraction - 0.6).abs() < f32::EPSILON);
     }
 }

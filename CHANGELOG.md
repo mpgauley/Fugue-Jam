@@ -5,6 +5,14 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 7
+
+- Preserved the adjustable Now Playing split ratio as the window is resized.
+- Saved and restored the last Library view.
+- Saved and restored equalizer enablement, selected band count, and gain values.
+- Added selectable 5-, 8-, 12-, 20-, and 31-band equalizers with frequency
+  ranges of 60 Hz–12 kHz, 30 Hz–18 kHz, or 20 Hz–20 kHz as appropriate.
+
 ## Version 6
 
 - Made Library gallery cards fixed square tiles with a strict 1:1 aspect ratio.

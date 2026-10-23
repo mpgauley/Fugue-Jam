@@ -21,12 +21,15 @@ the user's application data directory.
   to static playlists
 - Play, pause, stop, previous, and next controls
 - Waveform timeline with playback progress and click-to-seek controls
-- Five-band software equalizer with bass, treble, and vocal presets that apply
-  immediately during playback
+- Selectable 5-, 8-, 12-, 20-, and 31-band software equalizer with persistent
+  settings and bass, treble, and vocal presets that apply immediately during
+  playback
 - HDMI output keep-alive silence while a track is paused
 - Library rescan to find new tracks and remove missing files after a successful
   scan
 - Adjustable 75/25 album-art and queue layout in Now Playing
+- The Now Playing split ratio adjusts with the window size
+- The Library restores its last-used view
 - Playback for MP3, FLAC, WAV, AIFF, AAC, ALAC/M4A, and Ogg Vorbis files
 - Embedded tag reading through Lofty, including ID3, Vorbis comments, MP4, RIFF,
   and APE tags where applicable
