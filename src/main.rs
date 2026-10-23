@@ -29,7 +29,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
 const EQ_BAND_COUNTS: [usize; 5] = [5, 8, 12, 20, 31];
-const PROGRAM_VERSION: u32 = 7;
+const PROGRAM_VERSION: u32 = 8;
 
 struct EqualizerControls {
     gains: [AtomicU32; 31],
@@ -315,13 +315,47 @@ struct Playlist {
     smart: Option<(SmartField, String)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct QueueEntry {
+    path: PathBuf,
+    title: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredQueueEntry {
+    Entry(QueueEntry),
+    Path(PathBuf),
+}
+
+fn deserialize_queue<'de, D>(deserializer: D) -> Result<Vec<QueueEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries = Vec::<StoredQueueEntry>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| match entry {
+            StoredQueueEntry::Entry(entry) => entry,
+            StoredQueueEntry::Path(path) => QueueEntry {
+                title: path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("Unknown")
+                    .to_owned(),
+                path,
+            },
+        })
+        .collect())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct LibraryData {
     folders: Vec<PathBuf>,
     tracks: Vec<Track>,
     playlists: Vec<Playlist>,
-    #[serde(default)]
-    queue: Vec<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_queue")]
+    queue: Vec<QueueEntry>,
     #[serde(default)]
     library_view: LibraryView,
     #[serde(default = "default_eq_band_count")]
@@ -374,7 +408,6 @@ struct MusicApp {
     data: LibraryData,
     tab: Tab,
     selected_paths: HashSet<PathBuf>,
-    queue: Vec<PathBuf>,
     queue_index: Option<usize>,
     pending_queue_playlist: Option<PathBuf>,
     new_queue_playlist_name: String,
@@ -647,12 +680,20 @@ impl MusicApp {
             }
         });
         let eq_controls = Arc::new(EqualizerControls::new(&data.eq_bands, data.eq_enabled));
-        let library_indices = data
+        let library_indices: HashMap<PathBuf, usize> = data
             .tracks
             .iter()
             .enumerate()
             .map(|(index, track)| (track.path.clone(), index))
             .collect();
+        for entry in &mut data.queue {
+            if let Some(track) = library_indices
+                .get(&entry.path)
+                .and_then(|index| data.tracks.get(*index))
+            {
+                entry.title = track.display_title().to_owned();
+            }
+        }
         let library_view = data.library_view;
         let eq_bands = data.eq_bands.clone();
         let eq_band_count = data.eq_band_count;
@@ -660,7 +701,6 @@ impl MusicApp {
         let now_playing_left_fraction = data.now_playing_left_fraction;
         Self {
             data_path,
-            queue: data.queue.clone(),
             data,
             tab: Tab::NowPlaying,
             selected_paths: HashSet::new(),
@@ -707,7 +747,6 @@ impl MusicApp {
     }
 
     fn save(&mut self) {
-        self.data.queue.clone_from(&self.queue);
         self.data.library_view = self.library_view;
         self.data.eq_band_count = self.eq_band_count;
         self.data.eq_bands.clone_from(&self.eq_bands);
@@ -803,6 +842,14 @@ impl MusicApp {
                     if let Some(task) = &mut self.scan_task {
                         task.seen_tracks.insert(track.path.clone());
                     }
+                    for entry in self
+                        .data
+                        .queue
+                        .iter_mut()
+                        .filter(|entry| entry.path == track.path)
+                    {
+                        entry.title = track.display_title().to_owned();
+                    }
                     if let Some(index) = self.library_indices.get(&track.path).copied() {
                         self.data.tracks[index] = track;
                         refreshed_count += 1;
@@ -896,13 +943,13 @@ impl MusicApp {
         if removed.is_empty() {
             return 0;
         }
-        let current_path = self
+        let current_entry = self
             .queue_index
-            .and_then(|index| self.queue.get(index))
+            .and_then(|index| self.data.queue.get(index))
             .cloned();
-        if current_path
+        if current_entry
             .as_ref()
-            .is_some_and(|path| removed.contains(path))
+            .is_some_and(|entry| removed.contains(&entry.path))
         {
             self.stop();
         }
@@ -913,9 +960,15 @@ impl MusicApp {
             playlist.tracks.retain(|path| !removed.contains(path));
         });
         self.selected_paths.retain(|path| !removed.contains(path));
-        self.queue.retain(|path| !removed.contains(path));
-        if let Some(path) = current_path.filter(|path| !removed.contains(path)) {
-            self.queue_index = self.queue.iter().position(|queued| queued == &path);
+        self.data
+            .queue
+            .retain(|entry| !removed.contains(&entry.path));
+        if let Some(entry) = current_entry.filter(|entry| !removed.contains(&entry.path)) {
+            self.queue_index = self
+                .data
+                .queue
+                .iter()
+                .position(|queued| queued.path == entry.path);
         } else if self.sink.is_none() {
             self.queue_index = None;
         }
@@ -927,6 +980,21 @@ impl MusicApp {
             .map(|(index, track)| (track.path.clone(), index))
             .collect();
         removed.len()
+    }
+
+    fn queue_entry(&self, path: PathBuf) -> QueueEntry {
+        let title = self
+            .library_indices
+            .get(&path)
+            .and_then(|index| self.data.tracks.get(*index))
+            .map(|track| track.display_title().to_owned())
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "Unknown".to_owned());
+        QueueEntry { path, title }
     }
 
     fn finish_waveform_loads(&mut self) {
@@ -1040,7 +1108,11 @@ impl MusicApp {
             selected.shuffle(&mut rand::rng());
         }
         let count = selected.len();
-        self.queue.extend(selected);
+        let entries = selected
+            .into_iter()
+            .map(|path| self.queue_entry(path))
+            .collect::<Vec<_>>();
+        self.data.queue.extend(entries);
         self.status = format!("Added {count} selected track(s) to the queue.");
         self.save();
     }
@@ -1050,11 +1122,17 @@ impl MusicApp {
             self.status = "Select a track to play.".to_owned();
             return;
         };
-        if !self.queue.contains(&path) {
-            self.queue.push(path.clone());
+        if !self.data.queue.iter().any(|entry| entry.path == path) {
+            let entry = self.queue_entry(path.clone());
+            self.data.queue.push(entry);
             self.save();
         }
-        if let Some(index) = self.queue.iter().position(|queued| queued == &path) {
+        if let Some(index) = self
+            .data
+            .queue
+            .iter()
+            .position(|queued| queued.path == path)
+        {
             self.play_queue_index(index);
         }
     }
@@ -1088,7 +1166,11 @@ impl MusicApp {
             paths.shuffle(&mut rand::rng());
         }
         let count = paths.len();
-        self.queue.extend(paths);
+        let entries = paths
+            .into_iter()
+            .map(|path| self.queue_entry(path))
+            .collect::<Vec<_>>();
+        self.data.queue.extend(entries);
         self.status = format!(
             "Added {count} playlist track(s) to the queue{}.",
             if random { " in random order" } else { "" }
@@ -1097,14 +1179,14 @@ impl MusicApp {
     }
 
     fn remove_queue_track(&mut self, index: usize) {
-        if index >= self.queue.len() {
+        if index >= self.data.queue.len() {
             return;
         }
         if self.queue_index == Some(index) {
             self.stop();
-            self.queue.remove(index);
+            self.data.queue.remove(index);
         } else {
-            self.queue.remove(index);
+            self.data.queue.remove(index);
             if self.queue_index.is_some_and(|current| index < current) {
                 self.queue_index = self.queue_index.map(|current| current - 1);
             }
@@ -1113,11 +1195,11 @@ impl MusicApp {
     }
 
     fn play_queue_track_next(&mut self, index: usize) {
-        if index >= self.queue.len() || self.queue_index == Some(index) {
+        if index >= self.data.queue.len() || self.queue_index == Some(index) {
             return;
         }
         let current_index = self.queue_index;
-        let track = self.queue.remove(index);
+        let track = self.data.queue.remove(index);
         let current_after_removal = current_index.map(|current| {
             if index < current {
                 current - 1
@@ -1126,7 +1208,7 @@ impl MusicApp {
             }
         });
         let insertion_index = current_after_removal.map_or(0, |current| current + 1);
-        self.queue.insert(insertion_index, track);
+        self.data.queue.insert(insertion_index, track);
         self.queue_index = current_after_removal.map(|current| {
             if insertion_index <= current {
                 current + 1
@@ -1138,15 +1220,15 @@ impl MusicApp {
     }
 
     fn move_queue_track_to_end(&mut self, index: usize) {
-        if index >= self.queue.len() || index + 1 == self.queue.len() {
+        if index >= self.data.queue.len() || index + 1 == self.data.queue.len() {
             return;
         }
         let current_index = self.queue_index;
-        let track = self.queue.remove(index);
-        self.queue.push(track);
+        let track = self.data.queue.remove(index);
+        self.data.queue.push(track);
         self.queue_index = current_index.map(|current| {
             if index == current {
-                self.queue.len() - 1
+                self.data.queue.len() - 1
             } else if index < current {
                 current - 1
             } else {
@@ -1224,7 +1306,7 @@ impl MusicApp {
     }
 
     fn play_queue_index(&mut self, index: usize) {
-        let Some(path) = self.queue.get(index).cloned() else {
+        let Some(path) = self.data.queue.get(index).map(|entry| entry.path.clone()) else {
             self.status = "There is no track at that queue position.".to_owned();
             return;
         };
@@ -1278,7 +1360,7 @@ impl MusicApp {
 
     fn play_pause(&mut self) {
         let Some(sink) = self.sink.as_ref() else {
-            if !self.queue.is_empty() {
+            if !self.data.queue.is_empty() {
                 self.play_queue_index(self.queue_index.unwrap_or(0));
             } else {
                 self.status = "Add tracks to the queue before playing.".to_owned();
@@ -1321,12 +1403,12 @@ impl MusicApp {
 
     fn next_track(&mut self) {
         let Some(index) = self.queue_index else {
-            if !self.queue.is_empty() {
+            if !self.data.queue.is_empty() {
                 self.play_queue_index(0);
             }
             return;
         };
-        if index + 1 < self.queue.len() {
+        if index + 1 < self.data.queue.len() {
             self.play_queue_index(index + 1);
         } else {
             self.stop();
@@ -1842,9 +1924,10 @@ impl MusicApp {
                         .selectable_label(false, format!("{}. {}", position + 1, label))
                         .clicked()
                     {
-                        self.queue.push(path.clone());
+                        let entry = self.queue_entry(path.clone());
+                        self.data.queue.push(entry);
                         self.save();
-                        self.play_queue_index(self.queue.len() - 1);
+                        self.play_queue_index(self.data.queue.len() - 1);
                     }
                 }
                 if tracks.is_empty() {
@@ -1858,22 +1941,25 @@ impl MusicApp {
         ui.heading("Now playing queue");
         ui.horizontal(|ui| {
             if ui.button("Clear queue").clicked() {
-                self.queue.clear();
+                self.data.queue.clear();
                 self.queue_index = None;
                 self.stop();
             }
             if ui.button("Shuffle queue").clicked() {
-                let current = self
+                if let Some(current_index) = self
                     .queue_index
-                    .and_then(|index| self.queue.get(index).cloned());
-                self.queue.shuffle(&mut rand::rng());
-                if let Some(current) = current {
-                    self.queue_index = self.queue.iter().position(|path| path == &current);
+                    .filter(|index| *index < self.data.queue.len())
+                {
+                    let current = self.data.queue.remove(current_index);
+                    self.data.queue.shuffle(&mut rand::rng());
+                    self.data.queue.insert(0, current);
+                    self.queue_index = Some(0);
+                } else {
+                    self.data.queue.shuffle(&mut rand::rng());
                 }
                 self.save();
             }
         });
-        let queue = self.queue.clone();
         let static_playlists: Vec<(usize, String)> = self
             .data
             .playlists
@@ -1883,22 +1969,16 @@ impl MusicApp {
             .map(|(index, playlist)| (index, playlist.name.clone()))
             .collect();
         let mut action = None;
-        egui::ScrollArea::vertical()
-            .max_height(420.0)
-            .show(ui, |ui| {
-                for (index, path) in queue.iter().enumerate() {
-                    let title = self
-                        .data
-                        .tracks
-                        .iter()
-                        .find(|track| &track.path == path)
-                        .map(|track| track.display_title().to_owned())
-                        .unwrap_or_else(|| {
-                            path.file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("Unknown")
-                                .to_owned()
-                        });
+        let mut play_index = None;
+        let row_height = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
+        egui::ScrollArea::vertical().max_height(420.0).show_rows(
+            ui,
+            row_height,
+            self.data.queue.len(),
+            |ui, rows| {
+                for index in rows {
+                    let title = &self.data.queue[index].title;
+                    ui.set_min_height(row_height);
                     ui.horizontal(|ui| {
                         let marker = if self.queue_index == Some(index) {
                             "▶"
@@ -1910,7 +1990,7 @@ impl MusicApp {
                                 .sense(egui::Sense::click()),
                         );
                         if response.clicked() {
-                            self.play_queue_index(index);
+                            play_index = Some(index);
                         }
                         response.context_menu(|ui| {
                             if ui.button("Remove Track").clicked() {
@@ -1946,19 +2026,24 @@ impl MusicApp {
                         });
                     });
                 }
-            });
+            },
+        );
+        if let Some(index) = play_index {
+            self.play_queue_index(index);
+        }
         if let Some((index, action)) = action {
             match action {
                 QueueAction::Remove => self.remove_queue_track(index),
                 QueueAction::PlayNext => self.play_queue_track_next(index),
                 QueueAction::MoveToEnd => self.move_queue_track_to_end(index),
                 QueueAction::AddToPlaylist(playlist_index) => {
-                    if let Some(path) = queue.get(index) {
-                        self.add_queue_track_to_playlist(path, playlist_index);
+                    if let Some(path) = self.data.queue.get(index).map(|entry| entry.path.clone()) {
+                        self.add_queue_track_to_playlist(&path, playlist_index);
                     }
                 }
                 QueueAction::CreatePlaylist => {
-                    self.pending_queue_playlist = queue.get(index).cloned();
+                    self.pending_queue_playlist =
+                        self.data.queue.get(index).map(|entry| entry.path.clone());
                     self.new_queue_playlist_name.clear();
                 }
             }
@@ -2079,8 +2164,13 @@ impl MusicApp {
             ui.add_space(12.0);
             let artwork_path = self
                 .queue_index
-                .and_then(|index| self.queue.get(index))
-                .and_then(|path| self.data.tracks.iter().find(|track| &track.path == path))
+                .and_then(|index| self.data.queue.get(index))
+                .and_then(|entry| {
+                    self.data
+                        .tracks
+                        .iter()
+                        .find(|track| track.path == entry.path)
+                })
                 .and_then(|track| track.artwork_path.clone());
             if let Some(texture) = self.load_artwork(artwork_path.as_deref()) {
                 let max_side = ui
@@ -2618,9 +2708,9 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        EQ_BAND_COUNTS, LibraryData, LibraryView, Track, collect_audio_files, decode_artwork,
-        eq_frequencies, gallery_items, is_in_scan_scope, is_supported_audio_file, remap_eq_gains,
-        track_group_value,
+        EQ_BAND_COUNTS, LibraryData, LibraryView, QueueEntry, Track, collect_audio_files,
+        decode_artwork, eq_frequencies, gallery_items, is_in_scan_scope, is_supported_audio_file,
+        remap_eq_gains, track_group_value,
     };
     use std::{
         fs,
@@ -2760,13 +2850,22 @@ mod tests {
             serde_json::from_str(existing_library).expect("load previous library format");
         assert!(library.queue.is_empty());
 
-        library
-            .queue
-            .push(Path::new("/music/track.flac").to_path_buf());
+        let old_queue_library =
+            r#"{"folders":[],"tracks":[],"playlists":[],"queue":["/music/track.flac"]}"#;
+        let legacy: LibraryData =
+            serde_json::from_str(old_queue_library).expect("load path-only queue");
+        assert_eq!(legacy.queue[0].path, Path::new("/music/track.flac"));
+        assert_eq!(legacy.queue[0].title, "track");
+
+        library.queue.push(QueueEntry {
+            path: Path::new("/music/track.flac").to_path_buf(),
+            title: "Tagged title".to_owned(),
+        });
         let saved = serde_json::to_string(&library).expect("serialize library and queue");
         let restored: LibraryData =
             serde_json::from_str(&saved).expect("restore serialized library");
-        assert_eq!(restored.queue, library.queue);
+        assert_eq!(restored.queue[0].path, library.queue[0].path);
+        assert_eq!(restored.queue[0].title, "Tagged title");
     }
 
     #[test]

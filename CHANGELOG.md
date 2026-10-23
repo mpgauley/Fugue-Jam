@@ -5,6 +5,13 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 8
+
+- Reduced each Now Playing queue entry to only its track path and display title,
+  retaining compatibility with previously saved path-only queues.
+- Eliminated per-row library searches and full queue cloning while rendering.
+- Virtualized the queue list so only visible rows are rendered for large queues.
+
 ## Version 7
 
 - Preserved the adjustable Now Playing split ratio as the window is resized.

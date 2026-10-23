@@ -17,6 +17,7 @@ the user's application data directory.
 - Persistent music folders, library metadata, static playlists, and smart playlists
 - Queue actions for selected library tracks and playlists, in regular or shuffled order
 - Persistent Now Playing queue restored when the app reopens
+- Virtualized queue rows for responsive browsing of large queues
 - Queue context actions for removing, reordering, playing next, and adding tracks
   to static playlists
 - Play, pause, stop, previous, and next controls
