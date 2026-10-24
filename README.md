@@ -58,6 +58,19 @@ Then run:
 cargo run --release
 ```
 
+## Linux install package
+
+The **Package Linux** GitHub Actions workflow builds an x86_64 `.deb` package
+on Ubuntu 22.04 for Debian/Ubuntu systems when a `v*` version tag is pushed,
+and uploads the package and its SHA-256 checksum as GitHub Release assets. The
+workflow can also be run manually to produce a downloadable workflow artifact.
+
+To install a downloaded package:
+
+```sh
+sudo apt install ./fugue-jam_14.0.0-1_amd64.deb
+```
+
 The library database is saved under the operating system's per-user application
 data directory. Use **Add music folder…** on the Library tab to scan a folder.
 See [CHANGELOG.md](./CHANGELOG.md) for release history.

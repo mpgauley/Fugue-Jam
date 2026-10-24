@@ -1,9 +1,23 @@
 [package]
 name = "fugue-jam"
-version = "13.0.0"
+version = "14.0.0"
 edition = "2024"
 description = "A local-first Linux music player"
 license = "Apache-2.0"
+
+[package.metadata.deb]
+maintainer = "Matt Gauley <mpgauley@gmail.com>"
+extended-description = "A local-first Linux music player with a persistent library, playlists, queue, and equalizer."
+depends = "$auto"
+recommends = ["fonts-noto-cjk"]
+section = "sound"
+priority = "optional"
+assets = [
+    ["target/release/fugue-jam", "usr/bin/", "755"],
+    ["packaging/fugue-jam.desktop", "usr/share/applications/fugue-jam.desktop", "644"],
+    ["README.md", "usr/share/doc/fugue-jam/README.md", "644"],
+    ["LICENSE", "usr/share/doc/fugue-jam/LICENSE", "644"],
+]
 
 [dependencies]
 cpal = "0.15"

@@ -5,6 +5,12 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 14
+
+- Added a GitHub Actions workflow to build Debian/Ubuntu install packages for
+  Linux x86_64, publish release assets for version tags, and provide checksums.
+- Added a desktop launcher entry for installed packages.
+
 ## Version 13
 
 - Changed the second Stop press to reset the current queue selection to its

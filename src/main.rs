@@ -30,7 +30,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
 const EQ_BAND_COUNTS: [usize; 5] = [5, 8, 12, 20, 31];
-const PROGRAM_VERSION: u32 = 13;
+const PROGRAM_VERSION: u32 = 14;
 
 struct EqualizerControls {
     gains: [AtomicU32; 31],

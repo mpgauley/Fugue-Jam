@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Fugue Jam
+Comment=Local-first music player
+Exec=fugue-jam
+Icon=audio-x-generic
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupNotify=true
