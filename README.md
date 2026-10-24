@@ -33,8 +33,6 @@ the user's application data directory.
 - HDMI output keep-alive silence while a track is paused
 - Library rescan to find new tracks and remove missing files after a successful
   scan
-- Adjustable 75/25 album-art and queue layout in Now Playing
-- The Now Playing split ratio adjusts with the window size
 - The Library restores its last-used view
 - Playback for MP3, FLAC, WAV, AIFF, AAC, ALAC/M4A, and Ogg Vorbis files
 - Embedded tag reading through Lofty, including ID3, Vorbis comments, MP4, RIFF,
