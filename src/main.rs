@@ -29,8 +29,9 @@ use serde::{Deserialize, Serialize};
 const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
+const MAX_WAVEFORM_PEAKS: usize = 2048;
 const EQ_BAND_COUNTS: [usize; 5] = [5, 8, 12, 20, 31];
-const PROGRAM_VERSION: u32 = 14;
+const PROGRAM_VERSION: u32 = 17;
 
 struct EqualizerControls {
     gains: [AtomicU32; 31],
@@ -2380,28 +2381,30 @@ impl MusicApp {
                         .find(|track| track.path == entry.path)
                 })
                 .and_then(|track| track.artwork_path.clone());
+            let title = if self.current_title.is_empty() {
+                "Nothing playing".to_owned()
+            } else {
+                self.current_title.clone()
+            };
+            let available = ui.available_size();
+            let title_layout = ui.painter().layout(
+                title.clone(),
+                egui::TextStyle::Heading.resolve(ui.style()),
+                ui.visuals().text_color(),
+                available.x,
+            );
+            let image_height = (available.y - title_layout.size().y - 24.0).max(0.0);
+            let image_size = available.x.min(image_height);
             if let Some(texture) = self.load_artwork(artwork_path.as_deref()) {
-                let max_side = ui
-                    .available_width()
-                    .min(ui.available_height() * 0.75)
-                    .min(560.0);
                 ui.add(
                     egui::Image::from_texture(&texture)
-                        .fit_to_exact_size(egui::vec2(max_side, max_side)),
+                        .fit_to_exact_size(egui::vec2(image_size, image_size)),
                 );
             } else {
-                let size = ui
-                    .available_width()
-                    .min(ui.available_height() * 0.75)
-                    .min(560.0);
-                ui.add_sized([size, size], egui::Label::new("♫"));
+                ui.add_sized([image_size, image_size], egui::Label::new("♫"));
             }
             ui.add_space(12.0);
-            ui.heading(if self.current_title.is_empty() {
-                "Nothing playing"
-            } else {
-                &self.current_title
-            });
+            ui.heading(title);
         });
     }
 }
@@ -2497,6 +2500,42 @@ impl eframe::App for MusicApp {
                 painter.rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
                 let position = self.sink.as_ref().map(Sink::get_pos).unwrap_or_default();
                 let duration = self.track_duration;
+                let artwork_path = self
+                    .queue_index
+                    .and_then(|index| self.data.queue.get(index))
+                    .and_then(|entry| {
+                        self.library_indices
+                            .get(&entry.path)
+                            .and_then(|index| self.data.tracks.get(*index))
+                    })
+                    .and_then(|track| track.artwork_path.clone());
+                let artwork = self.load_artwork(artwork_path.as_deref());
+                let artwork_size = (rect.height() - 12.0).clamp(32.0, 96.0);
+                let artwork_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 8.0, rect.center().y - artwork_size * 0.5),
+                    egui::vec2(artwork_size, artwork_size),
+                );
+                if let Some(texture) = artwork {
+                    painter.image(
+                        texture.id(),
+                        artwork_rect,
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    painter.rect_filled(
+                        artwork_rect,
+                        4.0,
+                        ui.visuals().widgets.noninteractive.bg_fill,
+                    );
+                    painter.text(
+                        artwork_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "♫",
+                        egui::TextStyle::Heading.resolve(ui.style()),
+                        ui.visuals().text_color(),
+                    );
+                }
                 let fraction = duration
                     .filter(|duration| !duration.is_zero())
                     .map(|duration| {
@@ -2516,14 +2555,14 @@ impl eframe::App for MusicApp {
                         .unwrap_or_else(|| "—:—".to_owned())
                 );
                 painter.text(
-                    egui::pos2(rect.left() + 10.0, rect.top() + 8.0),
+                    egui::pos2(artwork_rect.right() + 10.0, rect.top() + 8.0),
                     egui::Align2::LEFT_TOP,
                     label,
                     egui::TextStyle::Body.resolve(ui.style()),
                     ui.visuals().text_color(),
                 );
                 let waveform_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + 8.0, rect.top() + 32.0),
+                    egui::pos2(artwork_rect.right() + 10.0, rect.top() + 32.0),
                     egui::pos2(rect.right() - 8.0, rect.bottom() - 8.0),
                 );
                 let center = waveform_rect.center().y;
@@ -2542,7 +2581,7 @@ impl eframe::App for MusicApp {
                             egui::pos2(x + bar_width * 0.5, center - half_height),
                             egui::pos2(x + bar_width * 0.5, center + half_height),
                         ],
-                        egui::Stroke::new(bar_width.max(1.0), color),
+                        egui::Stroke::new(bar_width.max(0.5), color),
                     );
                 }
                 if duration.is_some() {
@@ -2809,20 +2848,24 @@ fn decode_waveform(path: &Path) -> Result<Vec<f32>, String> {
     if sample_count > 0 {
         peaks.push(peak);
     }
-    if peaks.len() > 256 {
-        let source = std::mem::take(&mut peaks);
-        peaks = (0..256)
-            .map(|index| {
-                let start = index * source.len() / 256;
-                let end = ((index + 1) * source.len() / 256).max(start + 1);
-                source[start..end.min(source.len())]
-                    .iter()
-                    .copied()
-                    .fold(0.0, f32::max)
-            })
-            .collect();
+    Ok(reduce_waveform_peaks(peaks))
+}
+
+fn reduce_waveform_peaks(peaks: Vec<f32>) -> Vec<f32> {
+    if peaks.len() <= MAX_WAVEFORM_PEAKS {
+        return peaks;
     }
-    Ok(peaks)
+    let source = peaks;
+    (0..MAX_WAVEFORM_PEAKS)
+        .map(|index| {
+            let start = index * source.len() / MAX_WAVEFORM_PEAKS;
+            let end = ((index + 1) * source.len() / MAX_WAVEFORM_PEAKS).max(start + 1);
+            source[start..end.min(source.len())]
+                .iter()
+                .copied()
+                .fold(0.0, f32::max)
+        })
+        .collect()
 }
 
 fn decode_artwork(path: &Path) -> Result<egui::ColorImage, String> {
@@ -2949,9 +2992,9 @@ fn main() -> eframe::Result {
         "Fugue Jam",
         options,
         Box::new(|creation_context| {
-            if let Err(error) = install_japanese_font_fallback(&creation_context.egui_ctx) {
+            if let Err(error) = install_multilingual_font_fallback(&creation_context.egui_ctx) {
                 eprintln!(
-                    "Japanese text may not display because a Japanese font could not be loaded: {error}"
+                    "Some foreign-language text may not display because font fallbacks could not be loaded: {error}"
                 );
             }
             Ok(Box::new(MusicApp::new()))
@@ -2959,37 +3002,52 @@ fn main() -> eframe::Result {
     )
 }
 
-fn install_japanese_font_fallback(ctx: &egui::Context) -> Result<(), String> {
-    let output = Command::new("fc-match")
-        .args(["-f", "%{file}\n%{index}\n", ":lang=ja"])
-        .output()
-        .map_err(|error| format!("fontconfig lookup failed: {error}"))?;
-    if !output.status.success() {
-        return Err(format!("fontconfig exited with {}", output.status));
-    }
-    let output = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
-    let mut lines = output.lines();
-    let path = lines
-        .next()
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| "no Japanese-capable system font was found".to_owned())?;
-    let index = lines
-        .next()
-        .and_then(|index| index.parse::<u32>().ok())
-        .unwrap_or(0);
-    let font = fs::read(path).map_err(|error| format!("could not read {path}: {error}"))?;
+fn install_multilingual_font_fallback(ctx: &egui::Context) -> Result<(), String> {
+    let languages = [
+        ("japanese", "ja"),
+        ("chinese-simplified", "zh-cn"),
+        ("chinese-traditional", "zh-tw"),
+        ("korean", "ko"),
+        ("russian", "ru"),
+    ];
     let mut definitions = egui::FontDefinitions::default();
-    let mut font_data = egui::FontData::from_owned(font);
-    font_data.index = index;
-    definitions
-        .font_data
-        .insert("system-japanese-fallback".to_owned(), font_data.into());
+    let mut added_fonts = Vec::new();
+    for (name, language) in languages {
+        let output = Command::new("fc-match")
+            .args(["-f", "%{file}\n%{index}\n", &format!(":lang={language}")])
+            .output()
+            .map_err(|error| format!("fontconfig lookup for {language} failed: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "fontconfig lookup for {language} exited with {}",
+                output.status
+            ));
+        }
+        let output = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+        let mut lines = output.lines();
+        let path = lines
+            .next()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| format!("no {name}-capable system font was found"))?;
+        let index = lines
+            .next()
+            .and_then(|index| index.parse::<u32>().ok())
+            .unwrap_or(0);
+        let font = fs::read(path).map_err(|error| format!("could not read {path}: {error}"))?;
+        let mut font_data = egui::FontData::from_owned(font);
+        font_data.index = index;
+        let font_name = format!("system-{name}-fallback");
+        definitions
+            .font_data
+            .insert(font_name.clone(), font_data.into());
+        added_fonts.push(font_name);
+    }
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         definitions
             .families
             .entry(family)
             .or_default()
-            .push("system-japanese-fallback".to_owned());
+            .extend(added_fonts.iter().cloned());
     }
     ctx.set_fonts(definitions);
     Ok(())
@@ -2998,10 +3056,11 @@ fn install_japanese_font_fallback(ctx: &egui::Context) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EQ_BAND_COUNTS, LibraryData, LibraryView, QueueDisplayField, QueueEntry, Track,
-        available_library_view, collect_audio_files, decode_artwork, eq_frequencies,
-        first_tag_value_from_tags, gallery_items, is_in_scan_scope, is_supported_audio_file,
-        remap_eq_gains, stopped_queue_restart_target, track_group_value,
+        EQ_BAND_COUNTS, LibraryData, LibraryView, MAX_WAVEFORM_PEAKS, QueueDisplayField,
+        QueueEntry, Track, available_library_view, collect_audio_files, decode_artwork,
+        eq_frequencies, first_tag_value_from_tags, gallery_items, is_in_scan_scope,
+        is_supported_audio_file, reduce_waveform_peaks, remap_eq_gains,
+        stopped_queue_restart_target, track_group_value,
     };
     use std::{
         fs,
@@ -3016,6 +3075,18 @@ mod tests {
         assert!(is_supported_audio_file(Path::new("music/track.m4a")));
         assert!(!is_supported_audio_file(Path::new("music/cover.jpg")));
         assert!(!is_supported_audio_file(Path::new("music/track.opus")));
+    }
+
+    #[test]
+    fn waveform_resolution_preserves_detail_up_to_2048_peaks() {
+        let peaks = vec![0.25; MAX_WAVEFORM_PEAKS];
+        assert_eq!(reduce_waveform_peaks(peaks.clone()), peaks);
+
+        let mut high_resolution = vec![0.0; MAX_WAVEFORM_PEAKS * 4];
+        high_resolution[400 * 4 + 3] = 0.9;
+        let reduced = reduce_waveform_peaks(high_resolution);
+        assert_eq!(reduced.len(), MAX_WAVEFORM_PEAKS);
+        assert_eq!(reduced[400], 0.9);
     }
 
     #[test]

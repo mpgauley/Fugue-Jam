@@ -10,8 +10,8 @@ the user's application data directory.
   album artist, album, genre, or year
 - Background artwork loading and virtualized, vertically scrolling library views
 - Library controls for grouping, display type, sorting, and thumbnail size
-- Uses an installed Japanese-capable system font for Japanese song titles and
-  other supported language glyphs
+- Uses installed system fonts for Japanese, Simplified and Traditional
+  Chinese, Korean, and Russian song titles and other interface text
 - Non-blocking library scanning with progress and recursive subfolder scanning
   enabled by default
 - Right-click selected library tracks to queue them or create/add to a static
@@ -26,7 +26,8 @@ the user's application data directory.
   year, and track/disc number, plus track length
 - Play, pause, stop, previous, and next controls; a second Stop resets the
   queue selection to its first track without starting playback
-- Waveform timeline with playback progress and click-to-seek controls
+- High-resolution waveform timeline with playback progress, click-to-seek,
+  and current track album art
 - Selectable 5-, 8-, 12-, 20-, and 31-band software equalizer with persistent
   settings and bass, treble, and vocal presets that apply immediately during
   playback
@@ -47,7 +48,7 @@ device and its drivers.
 Install Rust and the ALSA development headers. On Debian or Ubuntu:
 
 ```sh
-sudo apt install build-essential pkg-config libasound2-dev fonts-noto-cjk
+sudo apt install build-essential pkg-config libasound2-dev fonts-noto-cjk fonts-noto-core
 ```
 
 Then run:
@@ -66,7 +67,7 @@ workflow can also be run manually to produce a downloadable workflow artifact.
 To install a downloaded package:
 
 ```sh
-sudo apt install ./fugue-jam_14.0.0-1_amd64.deb
+sudo apt install ./fugue-jam_17.0.0-1_amd64.deb
 ```
 
 The library database is saved under the operating system's per-user application

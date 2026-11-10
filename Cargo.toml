@@ -1,6 +1,6 @@
 [package]
 name = "fugue-jam"
-version = "14.0.0"
+version = "17.0.0"
 edition = "2024"
 description = "A local-first Linux music player"
 license = "Apache-2.0"
@@ -9,7 +9,7 @@ license = "Apache-2.0"
 maintainer = "Matt Gauley <mpgauley@gmail.com>"
 extended-description = "A local-first Linux music player with a persistent library, playlists, queue, and equalizer."
 depends = "$auto"
-recommends = ["fonts-noto-cjk"]
+recommends = ["fonts-noto-cjk", "fonts-noto-core"]
 section = "sound"
 priority = "optional"
 assets = [

@@ -5,6 +5,23 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 17
+
+- Scaled Now Playing album artwork to the largest size that fits the cover
+  frame, accounting for the track title and preserving the image aspect ratio.
+
+## Version 16
+
+- Increased waveform detail from 256 to 2,048 peak samples.
+- Added the current track's album artwork to the left side of the playback
+  timeline.
+
+## Version 15
+
+- Added fontconfig-selected UI fallback fonts for Simplified Chinese,
+  Traditional Chinese, Korean, and Russian, alongside Japanese.
+- Added Noto CJK and Noto core as recommended runtime font packages.
+
 ## Version 14
 
 - Added a GitHub Actions workflow to build Debian/Ubuntu install packages for
