@@ -5,6 +5,18 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 27
+
+- Increased the optional Now Playing queue album-art thumbnail from 36px to 45px.
+- Added a 5px gap between queue entries and bolded the Title tag.
+
+## Version 26
+
+- Now Playing queue rows place the first selected tag on the first line and
+  any remaining tags on a second line.
+- Added optional album art to Customize queue display; when enabled, a small
+  cover thumbnail appears beside the queue tags.
+
 ## Version 25
 
 - Expanded Linux install packages from Debian/Ubuntu to include RPM packages

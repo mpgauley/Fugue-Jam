@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use self::{audio::*, library::*};
 
-pub(crate) const PROGRAM_VERSION: u32 = 25;
+pub(crate) const PROGRAM_VERSION: u32 = 27;
 const AUDIO_EXTENSIONS: &[&str] = &[
     "aac", "aiff", "aif", "flac", "m4a", "mp3", "oga", "ogg", "wav",
 ];
@@ -272,6 +272,7 @@ struct Playlist {
 struct QueueEntry {
     path: PathBuf,
     title: String,
+    artwork_path: Option<PathBuf>,
     artist: String,
     album_artist: String,
     album: String,
@@ -330,6 +331,10 @@ impl QueueEntry {
     fn update_fields(&mut self, track: &Track, fields: &[QueueDisplayField]) {
         self.path.clone_from(&track.path);
         self.title = track.display_title().to_owned();
+        self.artwork_path = fields
+            .contains(&QueueDisplayField::AlbumArt)
+            .then(|| track.artwork_path.clone())
+            .flatten();
         self.artist = fields
             .contains(&QueueDisplayField::Artist)
             .then(|| track.artist.clone())
@@ -365,6 +370,9 @@ impl QueueEntry {
     }
 
     fn retain_fields(&mut self, fields: &[QueueDisplayField]) {
+        if !fields.contains(&QueueDisplayField::AlbumArt) {
+            self.artwork_path = None;
+        }
         if !fields.contains(&QueueDisplayField::Artist) {
             self.artist.clear();
         }
@@ -404,7 +412,9 @@ impl QueueEntry {
             QueueDisplayField::TrackLength => self
                 .duration_secs
                 .map(|secs| format_duration(Duration::from_secs(secs))),
-            QueueDisplayField::Composer | QueueDisplayField::Bpm => None,
+            QueueDisplayField::AlbumArt | QueueDisplayField::Composer | QueueDisplayField::Bpm => {
+                None
+            }
         }?;
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_owned())
@@ -422,12 +432,13 @@ enum QueueDisplayField {
     TrackNumber,
     DiscNumber,
     TrackLength,
+    AlbumArt,
     Composer,
     Bpm,
 }
 
 impl QueueDisplayField {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Title,
         Self::Artist,
         Self::AlbumArtist,
@@ -437,6 +448,7 @@ impl QueueDisplayField {
         Self::TrackNumber,
         Self::DiscNumber,
         Self::TrackLength,
+        Self::AlbumArt,
     ];
 
     fn label(self, language: Language) -> &'static str {
@@ -450,6 +462,7 @@ impl QueueDisplayField {
             Self::TrackNumber => tr(language, "Track number"),
             Self::DiscNumber => tr(language, "Disc number"),
             Self::TrackLength => tr(language, "Track length"),
+            Self::AlbumArt => tr(language, "Album art"),
             Self::Composer => "Composer",
             Self::Bpm => "BPM",
         }

@@ -30,7 +30,10 @@ the user's application data directory.
 - Queue context actions for removing, reordering, playing next, and adding tracks
   to static playlists
 - Customize queue rows to show common audio tags such as artist, album, genre,
-  year, and track/disc number, plus track length
+  year, track/disc number, and track length; optionally show a 45-pixel album-art
+  thumbnail beside the queue tags
+- The Now Playing queue separates tracks with extra spacing and emphasizes the
+  Title tag in bold
 - Play, pause, stop, previous, and next controls; a second Stop resets the
   queue selection to its first track without starting playback
 - High-resolution waveform timeline with playback progress, click-to-seek,
@@ -75,10 +78,10 @@ be run manually to produce downloadable workflow artifacts.
 Install a downloaded package using your distribution's package manager:
 
 ```sh
-sudo apt install ./fugue-jam_25.0.0-1_amd64.deb   # Debian/Ubuntu
-sudo dnf install ./fugue-jam-25.0.0-1.x86_64.rpm # Fedora/RHEL
-sudo zypper install ./fugue-jam-25.0.0-1.x86_64.rpm # openSUSE
-sudo pacman -U ./fugue-jam-25.0.0-1-x86_64.pkg.tar.zst # Arch Linux
+sudo apt install ./fugue-jam_27.0.0-1_amd64.deb   # Debian/Ubuntu
+sudo dnf install ./fugue-jam-27.0.0-1.x86_64.rpm # Fedora/RHEL
+sudo zypper install ./fugue-jam-27.0.0-1.x86_64.rpm # openSUSE
+sudo pacman -U ./fugue-jam-27.0.0-1-x86_64.pkg.tar.zst # Arch Linux
 ```
 
 The library database is saved under the operating system's per-user application

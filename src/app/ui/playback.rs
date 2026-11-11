@@ -40,31 +40,92 @@ impl MusicApp {
         let mut action = None;
         let mut play_index = None;
         let queue_display_fields = self.data.queue_display_fields.clone();
-        let row_height = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
+        let line_height = ui.text_style_height(&egui::TextStyle::Body);
+        let shows_album_art = queue_display_fields.contains(&QueueDisplayField::AlbumArt);
+        let tag_field_count = queue_display_fields
+            .iter()
+            .filter(|field| **field != QueueDisplayField::AlbumArt)
+            .count();
+        let line_count = if tag_field_count > 1 { 2.0 } else { 1.0 };
+        let artwork_size = 45.0;
+        let row_gap = 5.0;
+        let row_content_height = (line_height * line_count + ui.spacing().item_spacing.y)
+            .max(if shows_album_art { artwork_size } else { 0.0 });
+        let row_height = row_content_height + row_gap;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_height, self.data.queue.len(), |ui, rows| {
                 for index in rows {
-                    let entry = &self.data.queue[index];
-                    let values: Vec<String> = queue_display_fields
+                    let entry = self.data.queue[index].clone();
+                    let values: Vec<(QueueDisplayField, String)> = queue_display_fields
                         .iter()
-                        .filter_map(|field| entry.display_value(*field))
+                        .filter(|field| **field != QueueDisplayField::AlbumArt)
+                        .filter_map(|field| {
+                            entry.display_value(*field).map(|value| (*field, value))
+                        })
                         .collect();
-                    let title = if values.is_empty() {
-                        entry.title.as_str().to_owned()
-                    } else {
-                        values.join(" — ")
-                    };
+                    let (first_field, first_line) = values
+                        .first()
+                        .cloned()
+                        .unwrap_or((QueueDisplayField::Title, entry.title.clone()));
                     let marker = if self.queue_index == Some(index) {
                         "▶"
                     } else {
                         " "
                     };
-                    let response = ui.add_sized(
-                        [ui.available_width(), row_height],
-                        egui::Label::new(format!("{marker}  {title}"))
-                            .halign(egui::Align::Min)
-                            .sense(egui::Sense::click()),
+                    let width = ui.available_width();
+                    let item = ui.allocate_ui_with_layout(
+                        egui::vec2(width, row_content_height),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |row_ui| {
+                            row_ui.label(marker);
+                            if shows_album_art {
+                                if let Some(texture) =
+                                    self.load_artwork(entry.artwork_path.as_deref())
+                                {
+                                    row_ui.add(
+                                        egui::Image::from_texture(&texture).fit_to_exact_size(
+                                            egui::vec2(artwork_size, artwork_size),
+                                        ),
+                                    );
+                                } else {
+                                    row_ui.add_sized(
+                                        [artwork_size, artwork_size],
+                                        egui::Label::new("♫"),
+                                    );
+                                }
+                            }
+                            row_ui.vertical(|row_ui| {
+                                let first_line = egui::RichText::new(first_line);
+                                row_ui.label(if first_field == QueueDisplayField::Title {
+                                    first_line.strong()
+                                } else {
+                                    first_line
+                                });
+                                if values.len() > 1 {
+                                    row_ui.horizontal(|row_ui| {
+                                        for (index, (field, value)) in
+                                            values.iter().skip(1).enumerate()
+                                        {
+                                            if index > 0 {
+                                                row_ui.label(" — ");
+                                            }
+                                            let value = egui::RichText::new(value.clone());
+                                            row_ui.label(if *field == QueueDisplayField::Title {
+                                                value.strong()
+                                            } else {
+                                                value
+                                            });
+                                        }
+                                    });
+                                }
+                            });
+                        },
+                    );
+                    let response = ui.interact(
+                        item.response.rect,
+                        ui.id().with(("queue-row", index)),
+                        egui::Sense::click(),
                     );
                     if response.clicked() {
                         play_index = Some(index);
@@ -99,6 +160,7 @@ impl MusicApp {
                             }
                         });
                     });
+                    ui.add_space(row_gap);
                 }
             });
         if self.show_queue_display_options {

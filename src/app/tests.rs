@@ -486,6 +486,23 @@ fn queue_display_fields_show_selected_common_tags() {
 }
 
 #[test]
+fn queue_album_art_is_cached_only_when_selected() {
+    let track = Track {
+        path: Path::new("/music/song.flac").to_path_buf(),
+        artwork_path: Some(Path::new("/art/song.cover").to_path_buf()),
+        ..Track::default()
+    };
+    let mut entry = QueueEntry::from_track(&track, &[QueueDisplayField::AlbumArt]);
+    assert_eq!(entry.artwork_path, track.artwork_path);
+
+    entry.retain_fields(&[QueueDisplayField::Title]);
+    assert_eq!(entry.artwork_path, None);
+
+    entry.update_fields(&track, &[QueueDisplayField::AlbumArt]);
+    assert_eq!(entry.artwork_path, track.artwork_path);
+}
+
+#[test]
 fn queue_entries_keep_only_selected_track_metadata() {
     let track = Track {
         path: Path::new("/music/song.flac").to_path_buf(),
@@ -498,14 +515,20 @@ fn queue_entries_keep_only_selected_track_metadata() {
         track_number: Some("7".to_owned()),
         disc_number: Some("2".to_owned()),
         duration_secs: Some(184),
+        artwork_path: Some(Path::new("/art/song.cover").to_path_buf()),
         ..Track::default()
     };
-    let fields = [QueueDisplayField::Album, QueueDisplayField::TrackLength];
+    let fields = [
+        QueueDisplayField::Album,
+        QueueDisplayField::TrackLength,
+        QueueDisplayField::AlbumArt,
+    ];
     let mut entry = super::QueueEntry::from_track(&track, &fields);
     assert_eq!(entry.path, track.path);
     assert_eq!(entry.title, "Song");
     assert_eq!(entry.album, "Album");
     assert_eq!(entry.duration_secs, Some(184));
+    assert_eq!(entry.artwork_path, track.artwork_path);
     assert!(entry.artist.is_empty());
     assert!(entry.album_artist.is_empty());
     assert!(entry.genre.is_empty());
@@ -521,6 +544,7 @@ fn queue_entries_keep_only_selected_track_metadata() {
     assert_eq!(entry.year, Some(2024));
     assert!(entry.album.is_empty());
     assert_eq!(entry.duration_secs, None);
+    assert_eq!(entry.artwork_path, None);
 
     entry.album = "Stale album".to_owned();
     entry.retain_fields(&[QueueDisplayField::Title]);
@@ -601,7 +625,11 @@ fn equalizer_band_options_use_expected_frequency_ranges() {
 fn saved_view_and_equalizer_settings_round_trip() {
     let library = LibraryData {
         library_view: LibraryView::Album,
-        queue_display_fields: vec![QueueDisplayField::Artist, QueueDisplayField::Album],
+        queue_display_fields: vec![
+            QueueDisplayField::Artist,
+            QueueDisplayField::Album,
+            QueueDisplayField::AlbumArt,
+        ],
         eq_band_count: 8,
         eq_bands: vec![1.0; 8],
         eq_enabled: false,
@@ -613,7 +641,11 @@ fn saved_view_and_equalizer_settings_round_trip() {
     assert_eq!(restored.library_view, LibraryView::Album);
     assert_eq!(
         restored.queue_display_fields,
-        vec![QueueDisplayField::Artist, QueueDisplayField::Album]
+        vec![
+            QueueDisplayField::Artist,
+            QueueDisplayField::Album,
+            QueueDisplayField::AlbumArt
+        ]
     );
     assert_eq!(restored.eq_band_count, 8);
     assert_eq!(restored.eq_bands, vec![1.0; 8]);

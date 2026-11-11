@@ -1362,6 +1362,19 @@ const TRANSLATIONS: &[(&str, [&str; 8])] = &[
         ],
     ),
     (
+        "Album art",
+        [
+            "Album art",
+            "Pochette d’album",
+            "Portada del álbum",
+            "Albumcover",
+            "专辑封面",
+            "アルバムアート",
+            "Обложка альбома",
+            "앨범 아트",
+        ],
+    ),
+    (
         "When no selected tag has a value, the title is shown.",
         [
             "When no selected tag has a value, the title is shown.",
