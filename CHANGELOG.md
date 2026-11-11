@@ -5,6 +5,68 @@ the corresponding `N.0.0` version to follow Cargo's version format.
 For each future program change, add a new section with the next whole-number
 version and update the Cargo package version to `N.0.0`.
 
+## Version 25
+
+- Expanded Linux install packages from Debian/Ubuntu to include RPM packages
+  for Fedora, RHEL-compatible distributions, and openSUSE, plus native Arch
+  Linux packages.
+- The packaging workflow publishes all package formats and a shared SHA-256
+  checksum file for version-tagged releases.
+
+## Version 24
+
+- Added a Library button to rescan all saved music folders and refresh track
+  metadata in the background.
+- The metadata rescan preserves the existing library and playlist entries while
+  updating tags and showing scan progress.
+
+## Version 23
+
+- Library update scans remove tracks whose files are no longer found after a
+  successful scan.
+- When a missing track is recognized at a newly discovered path by its tags,
+  album artist, album, track number, and duration, the library entry and its
+  static playlist, queue, and selection references are updated instead of
+  retaining a duplicate.
+
+## Version 22
+
+- Playlist tracks are resolved in a background worker, so selecting a playlist
+  no longer blocks the interface while smart-playlist rules or large static
+  playlists are evaluated.
+- Playlist rows arrive in batches and render progressively in a virtualized
+  list; queue-copy actions become available after loading completes.
+
+## Version 21
+
+- Playlist queue entries now retain only the track path, fallback title, and
+  metadata fields selected for queue display.
+- Existing queue metadata is trimmed to the selected display fields on load;
+  changing the queue display updates metadata from the in-memory library.
+
+## Version 20
+
+- Added per-condition **contains** and **does not contain** matching to smart
+  playlists.
+- Smart playlist creation now scans saved library folders in the background,
+  displays scan progress in the status bar, refreshes library metadata, and
+  creates the playlist when scanning completes.
+
+## Version 19
+
+- Expanded smart playlists to support multiple metadata conditions joined with
+  AND/OR operators and nested parentheses.
+- Existing saved smart playlists migrate to equivalent single-condition rules.
+
+## Version 18
+
+- Added a language selector with English, French, Spanish, German, Simplified
+  Chinese, Japanese, Russian, and Korean.
+- Localized navigation, library and playlist controls, queue actions, equalizer
+  controls, dialogs, playback tooltips, and scan progress labels.
+- Saved the selected language in the library settings so it is restored on the
+  next launch.
+
 ## Version 17
 
 - Scaled Now Playing album artwork to the largest size that fits the cover

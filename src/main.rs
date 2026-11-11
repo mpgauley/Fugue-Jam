@@ -22,6 +22,8 @@ use lofty::{
     probe::Probe,
     tag::Accessor,
 };
+mod localization;
+use localization::{Language, tr};
 use rand::seq::SliceRandom;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::{Deserialize, Serialize};
@@ -31,7 +33,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
 ];
 const MAX_WAVEFORM_PEAKS: usize = 2048;
 const EQ_BAND_COUNTS: [usize; 5] = [5, 8, 12, 20, 31];
-const PROGRAM_VERSION: u32 = 17;
+const PROGRAM_VERSION: u32 = 25;
 
 struct EqualizerControls {
     gains: [AtomicU32; 31],
@@ -297,8 +299,9 @@ impl Track {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum SmartField {
+    #[default]
     AlbumArtist,
     Album,
     Genre,
@@ -316,11 +319,169 @@ impl SmartField {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum SmartMatch {
+    #[default]
+    Contains,
+    DoesNotContain,
+}
+
+impl SmartMatch {
+    fn matches(self, value: &str, query: &str) -> bool {
+        let contains = value.to_lowercase().contains(&query.trim().to_lowercase());
+        match self {
+            Self::Contains => contains,
+            Self::DoesNotContain => !contains,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum SmartOperator {
+    #[default]
+    And,
+    Or,
+}
+
+impl SmartOperator {
+    fn precedence(self) -> u8 {
+        match self {
+            Self::And => 2,
+            Self::Or => 1,
+        }
+    }
+
+    fn combine(self, left: bool, right: bool) -> bool {
+        match self {
+            Self::And => left && right,
+            Self::Or => left || right,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct SmartCondition {
+    field: SmartField,
+    query: String,
+    #[serde(default)]
+    comparison: SmartMatch,
+    open_parentheses: u8,
+    close_parentheses: u8,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct SmartPlaylistQuery {
+    conditions: Vec<SmartCondition>,
+    operators: Vec<SmartOperator>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredSmartPlaylistQuery {
+    Query(SmartPlaylistQuery),
+    Legacy((SmartField, String)),
+}
+
+fn deserialize_smart_playlist<'de, D>(
+    deserializer: D,
+) -> Result<Option<SmartPlaylistQuery>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<StoredSmartPlaylistQuery>::deserialize(deserializer).map(|stored| {
+        stored.map(|stored| match stored {
+            StoredSmartPlaylistQuery::Query(query) => query,
+            StoredSmartPlaylistQuery::Legacy((field, query)) => SmartPlaylistQuery {
+                conditions: vec![SmartCondition {
+                    field,
+                    query,
+                    ..SmartCondition::default()
+                }],
+                operators: Vec::new(),
+            },
+        })
+    })
+}
+
+impl SmartPlaylistQuery {
+    fn is_valid(&self) -> bool {
+        if self.conditions.is_empty()
+            || self.operators.len() + 1 != self.conditions.len()
+            || self
+                .conditions
+                .iter()
+                .any(|condition| condition.query.trim().is_empty())
+        {
+            return false;
+        }
+        let mut depth = 0_i32;
+        for condition in &self.conditions {
+            depth += i32::from(condition.open_parentheses);
+            depth -= i32::from(condition.close_parentheses);
+            if depth < 0 {
+                return false;
+            }
+        }
+        depth == 0
+    }
+
+    fn matches(&self, track: &Track) -> bool {
+        if !self.is_valid() {
+            return false;
+        }
+        let mut values = Vec::with_capacity(self.conditions.len());
+        let mut operators = Vec::new();
+        let close_group = |values: &mut Vec<bool>, operators: &mut Vec<Option<SmartOperator>>| {
+            if let (Some(right), Some(left), Some(Some(operator))) =
+                (values.pop(), values.pop(), operators.pop())
+            {
+                values.push(operator.combine(left, right));
+            }
+        };
+        for (index, condition) in self.conditions.iter().enumerate() {
+            for _ in 0..condition.open_parentheses {
+                operators.push(None);
+            }
+            values.push(
+                condition
+                    .comparison
+                    .matches(&condition.field.value(track), &condition.query),
+            );
+            for _ in 0..condition.close_parentheses {
+                while operators.last().is_some_and(Option::is_some) {
+                    close_group(&mut values, &mut operators);
+                }
+                if operators.pop().is_none() {
+                    return false;
+                }
+            }
+            if let Some(&next_operator) = self.operators.get(index) {
+                while operators.last().is_some_and(|operator| {
+                    operator.is_some_and(|top| top.precedence() >= next_operator.precedence())
+                }) {
+                    close_group(&mut values, &mut operators);
+                }
+                operators.push(Some(next_operator));
+            }
+        }
+        while !operators.is_empty() {
+            if operators.last().is_some_and(Option::is_none) {
+                return false;
+            }
+            close_group(&mut values, &mut operators);
+        }
+        values.as_slice() == [true]
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Playlist {
     name: String,
     tracks: Vec<PathBuf>,
-    smart: Option<(SmartField, String)>,
+    #[serde(default, deserialize_with = "deserialize_smart_playlist")]
+    smart: Option<SmartPlaylistQuery>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,18 +534,77 @@ impl QueueEntry {
         }
     }
 
-    fn from_track(track: &Track) -> Self {
-        Self {
+    fn from_track(track: &Track, fields: &[QueueDisplayField]) -> Self {
+        let mut entry = Self {
             path: track.path.clone(),
             title: track.display_title().to_owned(),
-            artist: track.artist.clone(),
-            album_artist: track.album_artist.clone(),
-            album: track.album.clone(),
-            genre: track.genre.clone(),
-            year: track.year,
-            track_number: track.track_number.clone(),
-            disc_number: track.disc_number.clone(),
-            duration_secs: track.duration_secs,
+            ..Self::default()
+        };
+        entry.update_fields(track, fields);
+        entry
+    }
+
+    fn update_fields(&mut self, track: &Track, fields: &[QueueDisplayField]) {
+        self.path.clone_from(&track.path);
+        self.title = track.display_title().to_owned();
+        self.artist = fields
+            .contains(&QueueDisplayField::Artist)
+            .then(|| track.artist.clone())
+            .unwrap_or_default();
+        self.album_artist = fields
+            .contains(&QueueDisplayField::AlbumArtist)
+            .then(|| track.album_artist.clone())
+            .unwrap_or_default();
+        self.album = fields
+            .contains(&QueueDisplayField::Album)
+            .then(|| track.album.clone())
+            .unwrap_or_default();
+        self.genre = fields
+            .contains(&QueueDisplayField::Genre)
+            .then(|| track.genre.clone())
+            .unwrap_or_default();
+        self.year = fields
+            .contains(&QueueDisplayField::Year)
+            .then_some(track.year)
+            .flatten();
+        self.track_number = fields
+            .contains(&QueueDisplayField::TrackNumber)
+            .then(|| track.track_number.clone())
+            .flatten();
+        self.disc_number = fields
+            .contains(&QueueDisplayField::DiscNumber)
+            .then(|| track.disc_number.clone())
+            .flatten();
+        self.duration_secs = fields
+            .contains(&QueueDisplayField::TrackLength)
+            .then_some(track.duration_secs)
+            .flatten();
+    }
+
+    fn retain_fields(&mut self, fields: &[QueueDisplayField]) {
+        if !fields.contains(&QueueDisplayField::Artist) {
+            self.artist.clear();
+        }
+        if !fields.contains(&QueueDisplayField::AlbumArtist) {
+            self.album_artist.clear();
+        }
+        if !fields.contains(&QueueDisplayField::Album) {
+            self.album.clear();
+        }
+        if !fields.contains(&QueueDisplayField::Genre) {
+            self.genre.clear();
+        }
+        if !fields.contains(&QueueDisplayField::Year) {
+            self.year = None;
+        }
+        if !fields.contains(&QueueDisplayField::TrackNumber) {
+            self.track_number = None;
+        }
+        if !fields.contains(&QueueDisplayField::DiscNumber) {
+            self.disc_number = None;
+        }
+        if !fields.contains(&QueueDisplayField::TrackLength) {
+            self.duration_secs = None;
         }
     }
 
@@ -436,17 +656,17 @@ impl QueueDisplayField {
         Self::TrackLength,
     ];
 
-    fn label(self) -> &'static str {
+    fn label(self, language: Language) -> &'static str {
         match self {
-            Self::Title => "Title",
-            Self::Artist => "Artist",
-            Self::AlbumArtist => "Album artist",
-            Self::Album => "Album",
-            Self::Genre => "Genre",
-            Self::Year => "Year",
-            Self::TrackNumber => "Track number",
-            Self::DiscNumber => "Disc number",
-            Self::TrackLength => "Track length",
+            Self::Title => tr(language, "Title"),
+            Self::Artist => tr(language, "Artist"),
+            Self::AlbumArtist => tr(language, "Album artist"),
+            Self::Album => tr(language, "Album"),
+            Self::Genre => tr(language, "Genre"),
+            Self::Year => tr(language, "Year"),
+            Self::TrackNumber => tr(language, "Track number"),
+            Self::DiscNumber => tr(language, "Disc number"),
+            Self::TrackLength => tr(language, "Track length"),
             Self::Composer => "Composer",
             Self::Bpm => "BPM",
         }
@@ -468,7 +688,7 @@ fn stopped_queue_restart_target(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct LibraryData {
     folders: Vec<PathBuf>,
-    tracks: Vec<Track>,
+    tracks: Arc<Vec<Track>>,
     playlists: Vec<Playlist>,
     #[serde(default, deserialize_with = "deserialize_queue")]
     queue: Vec<QueueEntry>,
@@ -484,13 +704,15 @@ struct LibraryData {
     eq_enabled: bool,
     #[serde(default = "default_now_playing_left_fraction")]
     now_playing_left_fraction: f32,
+    #[serde(default)]
+    language: Language,
 }
 
 impl Default for LibraryData {
     fn default() -> Self {
         Self {
             folders: Vec::new(),
-            tracks: Vec::new(),
+            tracks: Arc::new(Vec::new()),
             playlists: Vec::new(),
             queue: Vec::new(),
             queue_display_fields: default_queue_display_fields(),
@@ -499,6 +721,7 @@ impl Default for LibraryData {
             eq_bands: Vec::new(),
             eq_enabled: default_eq_enabled(),
             now_playing_left_fraction: default_now_playing_left_fraction(),
+            language: Language::default(),
         }
     }
 }
@@ -512,12 +735,12 @@ enum Tab {
 }
 
 impl Tab {
-    fn title(self) -> &'static str {
+    fn title(self, language: Language) -> &'static str {
         match self {
-            Self::NowPlaying => "Now Playing",
-            Self::Library => "Library",
-            Self::Playlists => "Playlists",
-            Self::Equalization => "Equalization",
+            Self::NowPlaying => tr(language, "Now Playing"),
+            Self::Library => tr(language, "Library"),
+            Self::Playlists => tr(language, "Playlists"),
+            Self::Equalization => tr(language, "Equalization"),
         }
     }
 }
@@ -537,10 +760,11 @@ struct MusicApp {
     sort_by: String,
     thumbnail_size: f32,
     active_playlist: Option<usize>,
+    playlist_load: Option<PlaylistLoadTask>,
     new_playlist_name: String,
     smart_playlist_name: String,
-    smart_field: usize,
-    smart_match: String,
+    smart_conditions: Vec<SmartCondition>,
+    smart_operators: Vec<SmartOperator>,
     status: String,
     _stream: Option<OutputStream>,
     stream_handle: Option<OutputStreamHandle>,
@@ -579,6 +803,27 @@ struct ScanTask {
     remove_missing: bool,
     recursive: bool,
     seen_tracks: HashSet<PathBuf>,
+    added_tracks: HashSet<PathBuf>,
+    smart_playlist: Option<(String, SmartPlaylistQuery)>,
+}
+
+#[derive(Clone)]
+struct PlaylistTrackRow {
+    path: PathBuf,
+    title: String,
+}
+
+struct PlaylistLoadTask {
+    playlist_index: usize,
+    receiver: Receiver<PlaylistLoadMessage>,
+    rows: Arc<Vec<PlaylistTrackRow>>,
+    finished: bool,
+    error: Option<String>,
+}
+
+enum PlaylistLoadMessage {
+    Batch(Vec<PlaylistTrackRow>),
+    Finished(Result<(), String>),
 }
 
 enum ScanMessage {
@@ -611,6 +856,21 @@ fn available_library_view(view: LibraryView) -> LibraryView {
     match view {
         LibraryView::AlbumArtist => LibraryView::Tracks,
         available => available,
+    }
+}
+
+fn parenthesis_label(language: Language, direction: &'static str, count: u8) -> String {
+    if count == 0 {
+        tr(language, "None").to_owned()
+    } else {
+        format!(
+            "{} {}",
+            tr(language, direction),
+            match direction {
+                "Open" => "(".repeat(count as usize),
+                _ => ")".repeat(count as usize),
+            }
+        )
     }
 }
 
@@ -814,12 +1074,19 @@ impl MusicApp {
             .enumerate()
             .map(|(index, track)| (track.path.clone(), index))
             .collect();
+        data.queue_display_fields
+            .retain(|field| QueueDisplayField::ALL.contains(field));
+        if data.queue_display_fields.is_empty() {
+            data.queue_display_fields = default_queue_display_fields();
+        }
         for entry in &mut data.queue {
             if let Some(track) = library_indices
                 .get(&entry.path)
                 .and_then(|index| data.tracks.get(*index))
             {
-                *entry = QueueEntry::from_track(track);
+                entry.update_fields(track, &data.queue_display_fields);
+            } else {
+                entry.retain_fields(&data.queue_display_fields);
             }
         }
         let library_view = data.library_view;
@@ -827,11 +1094,6 @@ impl MusicApp {
         let eq_band_count = data.eq_band_count;
         let eq_enabled = data.eq_enabled;
         let now_playing_left_fraction = data.now_playing_left_fraction;
-        data.queue_display_fields
-            .retain(|field| QueueDisplayField::ALL.contains(field));
-        if data.queue_display_fields.is_empty() {
-            data.queue_display_fields = default_queue_display_fields();
-        }
         Self {
             data_path,
             data,
@@ -847,10 +1109,11 @@ impl MusicApp {
             sort_by: "Album Name".to_owned(),
             thumbnail_size: 144.0,
             active_playlist: None,
+            playlist_load: None,
             new_playlist_name: String::new(),
             smart_playlist_name: String::new(),
-            smart_field: 0,
-            smart_match: String::new(),
+            smart_conditions: vec![SmartCondition::default()],
+            smart_operators: Vec::new(),
             status,
             _stream: stream,
             stream_handle,
@@ -912,6 +1175,62 @@ impl MusicApp {
         self.start_folder_scan(folder, true);
     }
 
+    fn rescan_all_metadata(&mut self) {
+        if self.scan_task.is_some() {
+            self.status = tr(
+                self.data.language,
+                "A library scan is already running. Try again when it finishes.",
+            )
+            .to_owned();
+            return;
+        }
+        let folders = self.data.folders.clone();
+        if folders.is_empty() {
+            self.status = tr(
+                self.data.language,
+                "Add a music folder before rescanning metadata.",
+            )
+            .to_owned();
+            return;
+        }
+        let recurse = self.scan_subfolders;
+        let artwork_dir = self
+            .data_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("album-art");
+        let progress = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let worker_progress = Arc::clone(&progress);
+        let worker_total = Arc::clone(&total);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = scan_folders(
+                &folders,
+                recurse,
+                &artwork_dir,
+                &worker_progress,
+                &worker_total,
+                &sender,
+            );
+            let _ = sender.send(ScanMessage::Finished(result));
+        });
+        self.status = tr(self.data.language, "Rescanning library metadata…").to_owned();
+        self.scan_task = Some(ScanTask {
+            folder: PathBuf::new(),
+            progress,
+            total,
+            receiver,
+            added_count: 0,
+            refreshed_count: 0,
+            remove_missing: false,
+            recursive: recurse,
+            seen_tracks: HashSet::new(),
+            added_tracks: HashSet::new(),
+            smart_playlist: None,
+        });
+    }
+
     fn start_folder_scan(&mut self, folder: PathBuf, remove_missing: bool) {
         if self.scan_task.is_some() {
             self.status = "A library scan is already running.".to_owned();
@@ -954,6 +1273,56 @@ impl MusicApp {
             remove_missing,
             recursive: recurse,
             seen_tracks: HashSet::new(),
+            added_tracks: HashSet::new(),
+            smart_playlist: None,
+        });
+    }
+
+    fn start_smart_playlist_scan(&mut self, name: String, query: SmartPlaylistQuery) {
+        if self.scan_task.is_some() {
+            self.status = tr(
+                self.data.language,
+                "A library scan is already running. Try again when it finishes.",
+            )
+            .to_owned();
+            return;
+        }
+        let folders = self.data.folders.clone();
+        let recurse = self.scan_subfolders;
+        let artwork_dir = self
+            .data_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("album-art");
+        let progress = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let worker_progress = Arc::clone(&progress);
+        let worker_total = Arc::clone(&total);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = scan_folders(
+                &folders,
+                recurse,
+                &artwork_dir,
+                &worker_progress,
+                &worker_total,
+                &sender,
+            );
+            let _ = sender.send(ScanMessage::Finished(result));
+        });
+        self.status = tr(self.data.language, "Scanning library for smart playlist…").to_owned();
+        self.scan_task = Some(ScanTask {
+            folder: PathBuf::new(),
+            progress,
+            total,
+            receiver,
+            added_count: 0,
+            refreshed_count: 0,
+            remove_missing: false,
+            recursive: recurse,
+            seen_tracks: HashSet::new(),
+            added_tracks: HashSet::new(),
+            smart_playlist: Some((name, query)),
         });
     }
 
@@ -982,15 +1351,18 @@ impl MusicApp {
                         .iter_mut()
                         .filter(|entry| entry.path == track.path)
                     {
-                        *entry = QueueEntry::from_track(&track);
+                        entry.update_fields(&track, &self.data.queue_display_fields);
                     }
                     if let Some(index) = self.library_indices.get(&track.path).copied() {
-                        self.data.tracks[index] = track;
+                        Arc::make_mut(&mut self.data.tracks)[index] = track;
                         refreshed_count += 1;
                     } else {
+                        if let Some(task) = &mut self.scan_task {
+                            task.added_tracks.insert(track.path.clone());
+                        }
                         self.library_indices
                             .insert(track.path.clone(), self.data.tracks.len());
-                        self.data.tracks.push(track);
+                        Arc::make_mut(&mut self.data.tracks).push(track);
                         added_count += 1;
                     }
                 }
@@ -998,8 +1370,8 @@ impl MusicApp {
             }
         }
         if finish_result.is_some() {
-            self.data
-                .tracks
+            self.playlist_load = None;
+            Arc::make_mut(&mut self.data.tracks)
                 .sort_by_key(|track| track.display_title().to_lowercase());
             self.library_indices = self
                 .data
@@ -1014,31 +1386,78 @@ impl MusicApp {
             task.refreshed_count += refreshed_count;
         }
         if let Some(result) = finish_result {
-            let (folder, added_count, refreshed_count, remove_missing, recursive, seen_tracks) =
-                self.scan_task
-                    .as_ref()
-                    .map(|task| {
-                        (
-                            task.folder.clone(),
-                            task.added_count,
-                            task.refreshed_count,
-                            task.remove_missing,
-                            task.recursive,
-                            task.seen_tracks.clone(),
-                        )
-                    })
-                    .unwrap_or_default();
+            let (
+                folder,
+                added_count,
+                refreshed_count,
+                remove_missing,
+                recursive,
+                seen_tracks,
+                added_tracks,
+                smart_playlist,
+            ) = self
+                .scan_task
+                .as_ref()
+                .map(|task| {
+                    (
+                        task.folder.clone(),
+                        task.added_count,
+                        task.refreshed_count,
+                        task.remove_missing,
+                        task.recursive,
+                        task.seen_tracks.clone(),
+                        task.added_tracks.clone(),
+                        task.smart_playlist.clone(),
+                    )
+                })
+                .unwrap_or_default();
             match result {
                 Ok(()) => {
-                    let removed_count = if remove_missing {
-                        self.remove_missing_tracks(&folder, recursive, &seen_tracks)
+                    if let Some((name, query)) = smart_playlist {
+                        self.data.playlists.push(Playlist {
+                            name: name.clone(),
+                            tracks: Vec::new(),
+                            smart: Some(query),
+                        });
+                        self.active_playlist = Some(self.data.playlists.len() - 1);
+                        self.smart_playlist_name.clear();
+                        self.smart_conditions = vec![SmartCondition::default()];
+                        self.smart_operators.clear();
+                        let scanned_count = self
+                            .scan_task
+                            .as_ref()
+                            .map(|task| task.progress.load(Ordering::Relaxed))
+                            .unwrap_or_default();
+                        self.status = format!(
+                            "{} “{name}” — {} {scanned_count} {}.",
+                            tr(self.data.language, "Created smart playlist"),
+                            tr(self.data.language, "after scanning"),
+                            tr(self.data.language, "tracks")
+                        );
+                        self.save();
+                        self.scan_task = None;
+                        return;
+                    }
+                    let (removed_count, moved_count) = if remove_missing {
+                        self.remove_missing_tracks(&folder, recursive, &seen_tracks, &added_tracks)
                     } else {
-                        0
+                        (0, 0)
                     };
-                    self.status = format!(
-                        "Added {added_count}, refreshed {refreshed_count}, and removed {removed_count} missing track(s) from {}.",
-                        folder.display(),
-                    );
+                    let added_count = added_count.saturating_sub(moved_count);
+                    let refreshed_count = refreshed_count + moved_count;
+                    self.status = if folder.as_os_str().is_empty() {
+                        format!(
+                            "{} {added_count} {}, {refreshed_count} {}.",
+                            tr(self.data.language, "Metadata rescan complete:"),
+                            tr(self.data.language, "new tracks found"),
+                            tr(self.data.language, "tracks refreshed")
+                        )
+                    } else {
+                        format!(
+                            "Added {added_count}, refreshed {refreshed_count}, and removed {removed_count} missing track(s) from {}.",
+                            folder.display(),
+                        )
+                    };
                     self.save();
                 }
                 Err(error) => {
@@ -1050,11 +1469,25 @@ impl MusicApp {
         } else if added_count + refreshed_count > 0
             && let Some(task) = &self.scan_task
         {
-            self.status = format!(
-                "Scanning {}… {} track(s) loaded",
-                task.folder.display(),
-                task.progress.load(Ordering::Relaxed)
-            );
+            self.status = if task.smart_playlist.is_some() {
+                format!(
+                    "{} {} track(s) loaded",
+                    tr(self.data.language, "Scanning library for smart playlist…"),
+                    task.progress.load(Ordering::Relaxed)
+                )
+            } else if task.folder.as_os_str().is_empty() {
+                format!(
+                    "{} {} track(s) loaded",
+                    tr(self.data.language, "Rescanning library metadata…"),
+                    task.progress.load(Ordering::Relaxed)
+                )
+            } else {
+                format!(
+                    "Scanning {}… {} track(s) loaded",
+                    task.folder.display(),
+                    task.progress.load(Ordering::Relaxed)
+                )
+            };
         }
     }
 
@@ -1063,8 +1496,9 @@ impl MusicApp {
         folder: &Path,
         recursive: bool,
         seen_tracks: &HashSet<PathBuf>,
-    ) -> usize {
-        let removed: HashSet<PathBuf> = self
+        added_tracks: &HashSet<PathBuf>,
+    ) -> (usize, usize) {
+        let missing: HashSet<PathBuf> = self
             .data
             .tracks
             .iter()
@@ -1074,9 +1508,36 @@ impl MusicApp {
             })
             .map(|track| track.path.clone())
             .collect();
-        if removed.is_empty() {
-            return 0;
+        if missing.is_empty() {
+            return (0, 0);
         }
+        let replacements = find_moved_track_paths(&self.data.tracks, &missing, added_tracks);
+        for (old_path, new_path) in &replacements {
+            for playlist in &mut self.data.playlists {
+                for path in &mut playlist.tracks {
+                    if path == old_path {
+                        path.clone_from(new_path);
+                    }
+                }
+            }
+            for entry in &mut self.data.queue {
+                if &entry.path == old_path {
+                    entry.path.clone_from(new_path);
+                    if let Some(track) = self
+                        .library_indices
+                        .get(new_path)
+                        .and_then(|index| self.data.tracks.get(*index))
+                    {
+                        entry.update_fields(track, &self.data.queue_display_fields);
+                    }
+                }
+            }
+            if self.selected_paths.remove(old_path) {
+                self.selected_paths.insert(new_path.clone());
+            }
+        }
+        let migrated: HashSet<PathBuf> = replacements.keys().cloned().collect();
+        let removed: HashSet<PathBuf> = missing.difference(&migrated).cloned().collect();
         let current_entry = self
             .queue_index
             .and_then(|index| self.data.queue.get(index))
@@ -1087,11 +1548,12 @@ impl MusicApp {
         {
             self.stop();
         }
-        self.data
-            .tracks
-            .retain(|track| !removed.contains(&track.path));
+        Arc::make_mut(&mut self.data.tracks).retain(|track| !removed.contains(&track.path));
         self.data.playlists.iter_mut().for_each(|playlist| {
-            playlist.tracks.retain(|path| !removed.contains(path));
+            let mut unique_paths = HashSet::new();
+            playlist
+                .tracks
+                .retain(|path| !removed.contains(path) && unique_paths.insert(path.clone()));
         });
         self.selected_paths.retain(|path| !removed.contains(path));
         self.data
@@ -1113,14 +1575,14 @@ impl MusicApp {
             .enumerate()
             .map(|(index, track)| (track.path.clone(), index))
             .collect();
-        removed.len()
+        (removed.len(), replacements.len())
     }
 
     fn queue_entry(&self, path: PathBuf) -> QueueEntry {
         self.library_indices
             .get(&path)
             .and_then(|index| self.data.tracks.get(*index))
-            .map(QueueEntry::from_track)
+            .map(|track| QueueEntry::from_track(track, &self.data.queue_display_fields))
             .unwrap_or_else(|| QueueEntry::from_path(path))
     }
 
@@ -1191,6 +1653,7 @@ impl MusicApp {
                 playlist.tracks.push(path);
             }
         }
+        self.playlist_load = None;
         self.save();
         self.status = format!("Added {count} selected track(s) to the playlist.");
     }
@@ -1264,17 +1727,70 @@ impl MusicApp {
         }
     }
 
-    fn playlist_tracks(&self, playlist: &Playlist) -> Vec<PathBuf> {
-        if let Some((field, query)) = &playlist.smart {
-            let needle = query.to_lowercase();
-            self.data
-                .tracks
-                .iter()
-                .filter(|track| field.value(track).to_lowercase().contains(&needle))
-                .map(|track| track.path.clone())
-                .collect()
-        } else {
-            playlist.tracks.clone()
+    fn ensure_playlist_load(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.active_playlist else {
+            self.playlist_load = None;
+            return;
+        };
+        if self
+            .playlist_load
+            .as_ref()
+            .is_some_and(|task| task.playlist_index == index)
+        {
+            return;
+        }
+        let Some(playlist) = self.data.playlists.get(index).cloned() else {
+            self.active_playlist = None;
+            self.playlist_load = None;
+            return;
+        };
+        let tracks = Arc::clone(&self.data.tracks);
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            load_playlist_rows(&playlist, &tracks, &sender, &ctx);
+        });
+        self.playlist_load = Some(PlaylistLoadTask {
+            playlist_index: index,
+            receiver,
+            rows: Arc::new(Vec::new()),
+            finished: false,
+            error: None,
+        });
+    }
+
+    fn receive_playlist_rows(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.playlist_load.as_mut() else {
+            return;
+        };
+        if task.finished {
+            return;
+        }
+        for _ in 0..8 {
+            let message = match task.receiver.try_recv() {
+                Ok(message) => message,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    task.finished = true;
+                    task.error = Some(
+                        tr(self.data.language, "Playlist loader stopped unexpectedly.").to_owned(),
+                    );
+                    break;
+                }
+            };
+            match message {
+                PlaylistLoadMessage::Batch(mut rows) => {
+                    Arc::make_mut(&mut task.rows).append(&mut rows)
+                }
+                PlaylistLoadMessage::Finished(result) => {
+                    task.finished = true;
+                    task.error = result.err();
+                    break;
+                }
+            }
+        }
+        if !task.finished {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
@@ -1283,12 +1799,20 @@ impl MusicApp {
             self.status = "Select a playlist first.".to_owned();
             return;
         };
-        let Some(playlist) = self.data.playlists.get(index) else {
-            self.active_playlist = None;
-            self.status = "That playlist no longer exists.".to_owned();
+        let Some(task) = self
+            .playlist_load
+            .as_ref()
+            .filter(|task| task.playlist_index == index && task.finished)
+        else {
+            self.status = tr(self.data.language, "Playlist is still loading.").to_owned();
             return;
         };
-        let mut paths = self.playlist_tracks(playlist);
+        if task.error.is_some() {
+            self.status =
+                tr(self.data.language, "Playlist loader stopped unexpectedly.").to_owned();
+            return;
+        }
+        let mut paths: Vec<PathBuf> = task.rows.iter().map(|row| row.path.clone()).collect();
         if random {
             paths.shuffle(&mut rand::rng());
         }
@@ -1409,27 +1933,19 @@ impl MusicApp {
 
     fn create_smart_playlist(&mut self) {
         let name = self.smart_playlist_name.trim().to_owned();
-        let query = self.smart_match.trim().to_owned();
-        if name.is_empty() || query.is_empty() {
-            self.status = "Enter a name and a matching value for the smart playlist.".to_owned();
+        let query = SmartPlaylistQuery {
+            conditions: self.smart_conditions.clone(),
+            operators: self.smart_operators.clone(),
+        };
+        if name.is_empty() || !query.is_valid() {
+            self.status = tr(
+                self.data.language,
+                "Enter a playlist name, values for every condition, and balanced parentheses.",
+            )
+            .to_owned();
             return;
         }
-        let field = match self.smart_field {
-            1 => SmartField::Album,
-            2 => SmartField::Genre,
-            3 => SmartField::Year,
-            _ => SmartField::AlbumArtist,
-        };
-        self.data.playlists.push(Playlist {
-            name: name.clone(),
-            tracks: Vec::new(),
-            smart: Some((field, query)),
-        });
-        self.active_playlist = Some(self.data.playlists.len() - 1);
-        self.smart_playlist_name.clear();
-        self.smart_match.clear();
-        self.save();
-        self.status = format!("Created smart playlist “{name}”.");
+        self.start_smart_playlist_scan(name, query);
     }
 
     fn play_queue_index(&mut self, index: usize) {
@@ -1615,11 +2131,23 @@ impl MusicApp {
 
     fn render_library(&mut self, ui: &mut egui::Ui) {
         let previous_library_view = self.library_view;
+        let language = self.data.language;
+        let group_by = match self.organize_by.as_str() {
+            "Album Artist" => "Album Artist",
+            "Genre" => "Genre",
+            "Decade" => "Decade",
+            _ => "No Grouping",
+        };
+        let sort_by = match self.sort_by.as_str() {
+            "Album Artist" => "Album Artist",
+            "Year" => "Year",
+            _ => "Album Name",
+        };
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     self.scan_task.is_none(),
-                    egui::Button::new("Add music folder…"),
+                    egui::Button::new(tr(language, "Add music folder…")),
                 )
                 .clicked()
             {
@@ -1628,74 +2156,118 @@ impl MusicApp {
             if ui
                 .add_enabled(
                     self.scan_task.is_none() && !self.data.folders.is_empty(),
-                    egui::Button::new("Scan for changes…"),
+                    egui::Button::new(tr(language, "Scan for changes…")),
                 )
-                .on_hover_text("Choose a folder to discover new files and remove missing files")
+                .on_hover_text(tr(
+                    language,
+                    "Choose a folder to discover new files and remove missing files",
+                ))
                 .clicked()
             {
                 self.rescan_folder();
             }
+            if ui
+                .add_enabled(
+                    self.scan_task.is_none() && !self.data.folders.is_empty(),
+                    egui::Button::new(tr(language, "Rescan all metadata")),
+                )
+                .on_hover_text(tr(
+                    language,
+                    "Refresh tags for all tracks in saved music folders",
+                ))
+                .clicked()
+            {
+                self.rescan_all_metadata();
+            }
             ui.add_enabled_ui(self.scan_task.is_none(), |ui| {
-                ui.checkbox(&mut self.scan_subfolders, "Scan subfolders");
+                ui.checkbox(&mut self.scan_subfolders, tr(language, "Scan subfolders"));
             });
-            ui.label(format!("{} tracks", self.data.tracks.len()));
+            ui.label(format!(
+                "{} {}",
+                self.data.tracks.len(),
+                tr(language, "tracks")
+            ));
         });
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("group_by")
-                .selected_text(format!("Group By: {}", self.organize_by))
+                .selected_text(format!(
+                    "{} {}",
+                    tr(language, "Group By:"),
+                    tr(language, group_by)
+                ))
                 .show_ui(ui, |ui| {
                     for mode in ["Album Artist", "Genre", "Decade", "No Grouping"] {
-                        ui.selectable_value(&mut self.organize_by, mode.to_owned(), mode);
+                        ui.selectable_value(
+                            &mut self.organize_by,
+                            mode.to_owned(),
+                            tr(language, mode),
+                        );
                     }
                 });
             egui::ComboBox::from_id_salt("display")
                 .selected_text(format!(
-                    "Display: {}",
-                    match self.library_view {
-                        LibraryView::Album => "Album",
-                        LibraryView::AlbumArtist => "Album Artist",
-                        LibraryView::Tracks => "Tracks",
-                    }
+                    "{} {}",
+                    tr(language, "Display:"),
+                    tr(
+                        language,
+                        match self.library_view {
+                            LibraryView::Album => "Album",
+                            LibraryView::AlbumArtist => "Album Artist",
+                            LibraryView::Tracks => "Tracks",
+                        }
+                    )
                 ))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.library_view, LibraryView::Album, "Album");
-                    ui.selectable_value(&mut self.library_view, LibraryView::Tracks, "Tracks");
+                    ui.selectable_value(
+                        &mut self.library_view,
+                        LibraryView::Album,
+                        tr(language, "Album"),
+                    );
+                    ui.selectable_value(
+                        &mut self.library_view,
+                        LibraryView::Tracks,
+                        tr(language, "Tracks"),
+                    );
                 });
             egui::ComboBox::from_id_salt("sort_by")
-                .selected_text(format!("Sort By: {}", self.sort_by))
+                .selected_text(format!(
+                    "{} {}",
+                    tr(language, "Sort By:"),
+                    tr(language, sort_by)
+                ))
                 .show_ui(ui, |ui| {
                     for mode in ["Album Name", "Album Artist", "Year"] {
-                        ui.selectable_value(&mut self.sort_by, mode.to_owned(), mode);
+                        ui.selectable_value(&mut self.sort_by, mode.to_owned(), tr(language, mode));
                     }
                 });
             ui.add(
                 egui::Slider::new(&mut self.thumbnail_size, 72.0..=240.0)
-                    .text("Thumbnail size")
+                    .text(tr(language, "Thumbnail size"))
                     .suffix(" px"),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("Search title, artist, album, genre…")
+                        .hint_text(tr(language, "Search title, artist, album, genre…"))
                         .desired_width(220.0),
                 );
             });
         });
         ui.horizontal(|ui| {
-            if ui.button("Add selected to queue").clicked() {
+            if ui.button(tr(language, "Add selected to queue")).clicked() {
                 self.add_selected_to_queue(false);
             }
-            if ui.button("Add selected randomly").clicked() {
+            if ui.button(tr(language, "Add selected randomly")).clicked() {
                 self.add_selected_to_queue(true);
             }
-            if ui.button("Play selection").clicked() {
+            if ui.button(tr(language, "Play selection")).clicked() {
                 self.play_selected_track();
             }
-            if ui.button("Select all visible").clicked() {
+            if ui.button(tr(language, "Select all visible")).clicked() {
                 self.selected_paths
                     .extend(self.visible_tracks().iter().map(|track| track.path.clone()));
             }
-            if ui.button("Clear selection").clicked() {
+            if ui.button(tr(language, "Clear selection")).clicked() {
                 self.selected_paths.clear();
             }
         });
@@ -1705,7 +2277,10 @@ impl MusicApp {
         let tracks = self.visible_tracks();
         if tracks.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("Your library is empty. Add a folder containing music files.");
+                ui.label(tr(
+                    language,
+                    "Your library is empty. Add a folder containing music files.",
+                ));
             });
         } else if self.library_view != LibraryView::Tracks {
             self.render_album_grid(ui, &tracks);
@@ -1715,14 +2290,18 @@ impl MusicApp {
     }
 
     fn render_track_list(&mut self, ui: &mut egui::Ui, tracks: &[Track]) {
+        let language = self.data.language;
         ui.horizontal(|ui| {
             ui.add_sized([48.0, 20.0], egui::Label::new(""));
-            ui.add_sized([210.0, 20.0], egui::Label::new("Track"));
-            ui.add_sized([140.0, 20.0], egui::Label::new("Album artist"));
-            ui.add_sized([150.0, 20.0], egui::Label::new("Album"));
-            ui.add_sized([48.0, 20.0], egui::Label::new("Year"));
-            ui.add_sized([58.0, 20.0], egui::Label::new("Type"));
-            ui.add_sized([55.0, 20.0], egui::Label::new("Duration"));
+            ui.add_sized([210.0, 20.0], egui::Label::new(tr(language, "Track")));
+            ui.add_sized(
+                [140.0, 20.0],
+                egui::Label::new(tr(language, "Album artist")),
+            );
+            ui.add_sized([150.0, 20.0], egui::Label::new(tr(language, "Album")));
+            ui.add_sized([48.0, 20.0], egui::Label::new(tr(language, "Year")));
+            ui.add_sized([58.0, 20.0], egui::Label::new(tr(language, "Type")));
+            ui.add_sized([55.0, 20.0], egui::Label::new(tr(language, "Duration")));
         });
         ui.separator();
         let icon_size = (self.thumbnail_size * 0.28).clamp(24.0, 80.0);
@@ -1737,7 +2316,11 @@ impl MusicApp {
                     let is_first_in_group = self.organize_by != "No Grouping"
                         && (index == 0
                             || group != track_group_value(&tracks[index - 1], &self.organize_by));
-                    let group_label = if group.is_empty() { "Unknown" } else { &group };
+                    let group_label = if group.is_empty() {
+                        tr(language, "Unknown")
+                    } else {
+                        &group
+                    };
                     let path = track.path.clone();
                     let texture = self.load_artwork(track.artwork_path.as_deref());
                     let row_response = ui
@@ -1803,6 +2386,7 @@ impl MusicApp {
     }
 
     fn render_album_grid(&mut self, ui: &mut egui::Ui, tracks: &[Track]) {
+        let language = self.data.language;
         let items = gallery_items(tracks, self.library_view, &self.organize_by, &self.sort_by);
         let mut grouped = std::collections::BTreeMap::<String, Vec<GalleryItem>>::new();
         for item in items {
@@ -1888,7 +2472,7 @@ impl MusicApp {
                                                 if item.artwork_path.is_some() && !artwork_failed {
                                                     "…"
                                                 } else if item.label.is_empty() {
-                                                    "Unknown"
+                                                    tr(language, "Unknown")
                                                 } else {
                                                     &item.label
                                                 },
@@ -1937,21 +2521,25 @@ impl MusicApp {
     }
 
     fn show_track_context_menu(&mut self, response: &egui::Response, paths: &[PathBuf]) {
+        let language = self.data.language;
         let selection_changed = paths.iter().any(|path| !self.selected_paths.contains(path));
         if response.secondary_clicked() && selection_changed {
             self.selected_paths.clear();
             self.selected_paths.extend(paths.iter().cloned());
         }
         response.context_menu(|ui| {
-            if ui.button("Play selection").clicked() {
+            if ui.button(tr(language, "Play selection")).clicked() {
                 self.play_selected_track();
                 ui.close_menu();
             }
-            if ui.button("Add selection to queue").clicked() {
+            if ui.button(tr(language, "Add selection to queue")).clicked() {
                 self.add_selected_to_queue(false);
                 ui.close_menu();
             }
-            if ui.button("Create playlist from selection").clicked() {
+            if ui
+                .button(tr(language, "Create playlist from selection"))
+                .clicked()
+            {
                 self.create_playlist_from_selection();
                 ui.close_menu();
             }
@@ -1961,7 +2549,7 @@ impl MusicApp {
                 .iter()
                 .any(|playlist| playlist.smart.is_none())
             {
-                ui.label("No static playlists yet");
+                ui.label(tr(language, "No static playlists yet"));
             }
             let playlists: Vec<(usize, String)> = self
                 .data
@@ -1972,7 +2560,10 @@ impl MusicApp {
                 .map(|(index, playlist)| (index, playlist.name.clone()))
                 .collect();
             for (index, name) in playlists {
-                if ui.button(format!("Add selection to {name}")).clicked() {
+                if ui
+                    .button(format!("{} {name}", tr(language, "Add selection to")))
+                    .clicked()
+                {
                     self.add_selection_to_playlist(index);
                     ui.close_menu();
                 }
@@ -2010,118 +2601,297 @@ impl MusicApp {
     }
 
     fn render_playlists(&mut self, ui: &mut egui::Ui) {
+        let language = self.data.language;
+        self.ensure_playlist_load(ui.ctx());
+        self.receive_playlist_rows(ui.ctx());
+        let playlist_labels: Vec<(usize, String)> = self
+            .data
+            .playlists
+            .iter()
+            .enumerate()
+            .map(|(index, playlist)| {
+                let mut label = playlist.name.clone();
+                if playlist.smart.is_some() {
+                    label.push_str(&format!("  ·  {}", tr(language, "smart")));
+                } else {
+                    label.push_str(&format!(
+                        "  ·  {} {}",
+                        playlist.tracks.len(),
+                        tr(language, "tracks")
+                    ));
+                }
+                (index, label)
+            })
+            .collect();
+        let mut selected_track = None;
         ui.columns(2, |columns| {
-            columns[0].heading("Your playlists");
-            for (index, playlist) in self.data.playlists.iter().enumerate() {
-                let label = format!(
-                    "{}  ·  {} tracks{}",
-                    playlist.name,
-                    self.playlist_tracks(playlist).len(),
-                    if playlist.smart.is_some() {
-                        "  ·  smart"
-                    } else {
-                        ""
-                    }
-                );
+            columns[0].heading(tr(language, "Your playlists"));
+            for (index, label) in &playlist_labels {
                 if columns[0]
-                    .selectable_label(self.active_playlist == Some(index), label)
+                    .selectable_label(self.active_playlist == Some(*index), label)
                     .clicked()
                 {
-                    self.active_playlist = Some(index);
+                    self.active_playlist = Some(*index);
                 }
             }
             columns[0].separator();
-            columns[0].label("Static playlist from selected tracks");
+            columns[0].label(tr(language, "Static playlist from selected tracks"));
             columns[0].horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_playlist_name)
-                        .hint_text("Playlist name"),
+                        .hint_text(tr(language, "Playlist name")),
                 );
-                if ui.button("Create").clicked() {
+                if ui.button(tr(language, "Create")).clicked() {
                     self.create_static_playlist();
                 }
             });
             columns[0].separator();
-            columns[0].label("Smart playlist (field contains value)");
-            egui::ComboBox::from_id_salt("smart_field")
-                .selected_text(["Album artist", "Album", "Genre", "Year"][self.smart_field.min(3)])
-                .show_ui(&mut columns[0], |ui| {
-                    for (index, field) in ["Album artist", "Album", "Genre", "Year"]
-                        .iter()
-                        .enumerate()
+            columns[0].label(tr(language, "Smart playlist conditions"));
+            let mut remove_condition = None;
+            for index in 0..self.smart_conditions.len() {
+                columns[0].horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt(("smart_field", index))
+                        .selected_text(tr(
+                            language,
+                            match self.smart_conditions[index].field {
+                                SmartField::AlbumArtist => "Album artist",
+                                SmartField::Album => "Album",
+                                SmartField::Genre => "Genre",
+                                SmartField::Year => "Year",
+                            },
+                        ))
+                        .show_ui(ui, |ui| {
+                            for (field, label) in [
+                                (SmartField::AlbumArtist, "Album artist"),
+                                (SmartField::Album, "Album"),
+                                (SmartField::Genre, "Genre"),
+                                (SmartField::Year, "Year"),
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.smart_conditions[index].field,
+                                    field,
+                                    tr(language, label),
+                                );
+                            }
+                        });
+                    egui::ComboBox::from_id_salt(("smart_comparison", index))
+                        .selected_text(tr(
+                            language,
+                            match self.smart_conditions[index].comparison {
+                                SmartMatch::Contains => "contains",
+                                SmartMatch::DoesNotContain => "does not contain",
+                            },
+                        ))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.smart_conditions[index].comparison,
+                                SmartMatch::Contains,
+                                tr(language, "contains"),
+                            );
+                            ui.selectable_value(
+                                &mut self.smart_conditions[index].comparison,
+                                SmartMatch::DoesNotContain,
+                                tr(language, "does not contain"),
+                            );
+                        });
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.smart_conditions[index].query)
+                            .hint_text(tr(language, "Matching value"))
+                            .desired_width(100.0),
+                    );
+                    egui::ComboBox::from_id_salt(("smart_open", index))
+                        .selected_text(parenthesis_label(
+                            language,
+                            "Open",
+                            self.smart_conditions[index].open_parentheses,
+                        ))
+                        .show_ui(ui, |ui| {
+                            for count in 0..=3 {
+                                ui.selectable_value(
+                                    &mut self.smart_conditions[index].open_parentheses,
+                                    count,
+                                    parenthesis_label(language, "Open", count),
+                                );
+                            }
+                        });
+                    egui::ComboBox::from_id_salt(("smart_close", index))
+                        .selected_text(parenthesis_label(
+                            language,
+                            "Close",
+                            self.smart_conditions[index].close_parentheses,
+                        ))
+                        .show_ui(ui, |ui| {
+                            for count in 0..=3 {
+                                ui.selectable_value(
+                                    &mut self.smart_conditions[index].close_parentheses,
+                                    count,
+                                    parenthesis_label(language, "Close", count),
+                                );
+                            }
+                        });
+                    if index < self.smart_operators.len() {
+                        egui::ComboBox::from_id_salt(("smart_operator", index))
+                            .selected_text(tr(
+                                language,
+                                match self.smart_operators[index] {
+                                    SmartOperator::And => "And",
+                                    SmartOperator::Or => "Or",
+                                },
+                            ))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.smart_operators[index],
+                                    SmartOperator::And,
+                                    tr(language, "And"),
+                                );
+                                ui.selectable_value(
+                                    &mut self.smart_operators[index],
+                                    SmartOperator::Or,
+                                    tr(language, "Or"),
+                                );
+                            });
+                    }
+                    if self.smart_conditions.len() > 1
+                        && ui
+                            .small_button(tr(language, "Remove"))
+                            .on_hover_text(tr(language, "Remove condition"))
+                            .clicked()
                     {
-                        ui.selectable_value(&mut self.smart_field, index, *field);
+                        remove_condition = Some(index);
                     }
                 });
-            columns[0].horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.smart_match).hint_text("Matching value"),
-                );
-            });
+            }
+            if let Some(index) = remove_condition {
+                self.smart_conditions.remove(index);
+                let operator_index = if index < self.smart_operators.len() {
+                    index
+                } else {
+                    self.smart_operators.len().saturating_sub(1)
+                };
+                if !self.smart_operators.is_empty() {
+                    self.smart_operators.remove(operator_index);
+                }
+            }
+            if columns[0].button(tr(language, "Add condition")).clicked() {
+                if !self.smart_conditions.is_empty() {
+                    self.smart_operators.push(SmartOperator::And);
+                }
+                self.smart_conditions.push(SmartCondition::default());
+            }
             columns[0].horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.smart_playlist_name)
-                        .hint_text("Playlist name"),
+                        .hint_text(tr(language, "Playlist name")),
                 );
-                if ui.button("Create smart playlist").clicked() {
+                if ui
+                    .add_enabled(
+                        self.scan_task.is_none(),
+                        egui::Button::new(tr(language, "Create smart playlist")),
+                    )
+                    .clicked()
+                {
                     self.create_smart_playlist();
                 }
             });
 
-            columns[1].heading(
-                self.active_playlist
-                    .and_then(|index| self.data.playlists.get(index))
-                    .map(|playlist| playlist.name.as_str())
-                    .unwrap_or("Playlist tracks"),
-            );
+            let active_index = self.active_playlist;
+            let playlist_loading = self
+                .playlist_load
+                .as_ref()
+                .filter(|task| Some(task.playlist_index) == active_index);
+            let loaded_rows = playlist_loading
+                .map(|task| Arc::clone(&task.rows))
+                .unwrap_or_else(|| Arc::new(Vec::new()));
+            let loading_finished = playlist_loading.is_some_and(|task| task.finished);
+            let loading_error = playlist_loading.and_then(|task| task.error.clone());
+            let active_name = active_index
+                .and_then(|index| self.data.playlists.get(index))
+                .map(|playlist| playlist.name.clone())
+                .unwrap_or_else(|| tr(language, "Playlist tracks").to_owned());
+            columns[1].heading(active_name);
             columns[1].horizontal(|ui| {
-                if ui.button("Copy to queue").clicked() {
+                if ui
+                    .add_enabled(
+                        loading_finished && loading_error.is_none(),
+                        egui::Button::new(tr(language, "Copy to queue")),
+                    )
+                    .clicked()
+                {
                     self.copy_playlist_to_queue(false);
                 }
-                if ui.button("Copy to queue randomly").clicked() {
+                if ui
+                    .add_enabled(
+                        loading_finished && loading_error.is_none(),
+                        egui::Button::new(tr(language, "Copy to queue randomly")),
+                    )
+                    .clicked()
+                {
                     self.copy_playlist_to_queue(true);
                 }
             });
-            let tracks = self
-                .active_playlist
-                .and_then(|index| self.data.playlists.get(index))
-                .map(|playlist| self.playlist_tracks(playlist))
-                .unwrap_or_default();
-            egui::ScrollArea::vertical().show(&mut columns[1], |ui| {
-                for (position, path) in tracks.iter().enumerate() {
-                    let label = self
-                        .data
-                        .tracks
-                        .iter()
-                        .find(|track| &track.path == path)
-                        .map(|track| track.display_title().to_owned())
-                        .unwrap_or_else(|| path.display().to_string());
-                    if ui
-                        .selectable_label(false, format!("{}. {}", position + 1, label))
-                        .clicked()
-                    {
-                        let entry = self.queue_entry(path.clone());
-                        self.data.queue.push(entry);
-                        self.save();
-                        self.play_queue_index(self.data.queue.len() - 1);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show_rows(&mut columns[1], 24.0, loaded_rows.len(), |ui, row_range| {
+                    for index in row_range {
+                        let row = &loaded_rows[index];
+                        if ui
+                            .selectable_label(false, format!("{}. {}", index + 1, row.title))
+                            .clicked()
+                        {
+                            selected_track = Some(row.path.clone());
+                        }
                     }
+                });
+            if loaded_rows.is_empty() {
+                if active_index.is_none() {
+                    columns[1].label(tr(language, "Select a playlist to see its tracks."));
+                } else if let Some(error) = loading_error {
+                    columns[1].label(format!(
+                        "{}: {error}",
+                        tr(language, "Could not load playlist")
+                    ));
+                } else if loading_finished {
+                    columns[1].label(tr(language, "This playlist has no tracks."));
+                } else {
+                    columns[1].label(tr(language, "Loading playlist…"));
                 }
-                if tracks.is_empty() {
-                    ui.label("Select a playlist to see its tracks.");
-                }
-            });
+            } else if let Some(error) = loading_error {
+                columns[1].label(format!(
+                    "{}: {error}",
+                    tr(language, "Could not load playlist")
+                ));
+            } else if !loading_finished {
+                columns[1].label(format!(
+                    "{} {} {}",
+                    tr(language, "Loading playlist…"),
+                    loaded_rows.len(),
+                    tr(language, "tracks loaded")
+                ));
+            }
         });
+        if self.active_playlist != self.playlist_load.as_ref().map(|task| task.playlist_index) {
+            self.ensure_playlist_load(ui.ctx());
+            self.receive_playlist_rows(ui.ctx());
+        }
+        if let Some(path) = selected_track {
+            let entry = self.queue_entry(path);
+            self.data.queue.push(entry);
+            self.save();
+            self.play_queue_index(self.data.queue.len() - 1);
+        }
     }
 
     fn render_queue(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Now playing queue");
+        let language = self.data.language;
+        ui.heading(tr(language, "Now playing queue"));
         ui.horizontal(|ui| {
-            if ui.button("Clear queue").clicked() {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if ui.button(tr(language, "Clear\nqueue")).clicked() {
                 self.data.queue.clear();
                 self.queue_index = None;
                 self.stop();
             }
-            if ui.button("Shuffle queue").clicked() {
+            if ui.button(tr(language, "Shuffle\nqueue")).clicked() {
                 if let Some(current_index) = self
                     .queue_index
                     .filter(|index| *index < self.data.queue.len())
@@ -2135,7 +2905,7 @@ impl MusicApp {
                 }
                 self.save();
             }
-            if ui.button("Customize display…").clicked() {
+            if ui.button(tr(language, "Customize\ndisplay…")).clicked() {
                 self.show_queue_display_options = true;
             }
         });
@@ -2180,25 +2950,25 @@ impl MusicApp {
                         play_index = Some(index);
                     }
                     response.context_menu(|ui| {
-                        if ui.button("Remove Track").clicked() {
+                        if ui.button(tr(language, "Remove Track")).clicked() {
                             action = Some((index, QueueAction::Remove));
                             ui.close_menu();
                         }
-                        if ui.button("Play Track Next").clicked() {
+                        if ui.button(tr(language, "Play Track Next")).clicked() {
                             action = Some((index, QueueAction::PlayNext));
                             ui.close_menu();
                         }
-                        if ui.button("Move Track to the End").clicked() {
+                        if ui.button(tr(language, "Move Track to the End")).clicked() {
                             action = Some((index, QueueAction::MoveToEnd));
                             ui.close_menu();
                         }
-                        ui.menu_button("Add Track to Playlist…", |ui| {
-                            if ui.button("Create new playlist…").clicked() {
+                        ui.menu_button(tr(language, "Add Track to Playlist…"), |ui| {
+                            if ui.button(tr(language, "Create new playlist…")).clicked() {
                                 action = Some((index, QueueAction::CreatePlaylist));
                                 ui.close_menu();
                             }
                             if static_playlists.is_empty() {
-                                ui.label("No static playlists yet");
+                                ui.label(tr(language, "No static playlists yet"));
                             }
                             for (playlist_index, name) in &static_playlists {
                                 if ui.button(name).clicked() {
@@ -2217,16 +2987,23 @@ impl MusicApp {
                 .map(|field| self.data.queue_display_fields.contains(field))
                 .collect();
             let mut display_changed = false;
-            egui::Window::new("Customize queue display")
+            egui::Window::new(tr(language, "Customize queue display"))
                 .open(&mut self.show_queue_display_options)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
-                    ui.label("Select the track information to show for each queued track.");
+                    ui.label(tr(
+                        language,
+                        "Select the track information to show for each queued track.",
+                    ));
                     for (index, field) in QueueDisplayField::ALL.iter().enumerate() {
-                        display_changed |=
-                            ui.checkbox(&mut selected[index], field.label()).changed();
+                        display_changed |= ui
+                            .checkbox(&mut selected[index], field.label(language))
+                            .changed();
                     }
-                    ui.label("When no selected tag has a value, the title is shown.");
+                    ui.label(tr(
+                        language,
+                        "When no selected tag has a value, the title is shown.",
+                    ));
                 });
             if display_changed {
                 self.data.queue_display_fields = QueueDisplayField::ALL
@@ -2234,6 +3011,17 @@ impl MusicApp {
                     .zip(selected)
                     .filter_map(|(field, selected)| selected.then_some(*field))
                     .collect();
+                for entry in &mut self.data.queue {
+                    if let Some(track) = self
+                        .library_indices
+                        .get(&entry.path)
+                        .and_then(|index| self.data.tracks.get(*index))
+                    {
+                        entry.update_fields(track, &self.data.queue_display_fields);
+                    } else {
+                        entry.retain_fields(&self.data.queue_display_fields);
+                    }
+                }
                 self.save();
             }
         }
@@ -2260,17 +3048,17 @@ impl MusicApp {
         if let Some(path) = self.pending_queue_playlist.clone() {
             let mut create = false;
             let mut cancel = false;
-            egui::Window::new("Create playlist")
+            egui::Window::new(tr(language, "Create playlist"))
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
-                    ui.label("Create a static playlist with this track.");
+                    ui.label(tr(language, "Create a static playlist with this track."));
                     ui.text_edit_singleline(&mut self.new_queue_playlist_name);
                     ui.horizontal(|ui| {
-                        if ui.button("Create").clicked() {
+                        if ui.button(tr(language, "Create")).clicked() {
                             create = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(tr(language, "Cancel")).clicked() {
                             cancel = true;
                         }
                     });
@@ -2298,17 +3086,27 @@ impl MusicApp {
     }
 
     fn render_equalization(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Equalization");
-        ui.label(format!("{}-band equalizer controls", self.eq_band_count));
+        let language = self.data.language;
+        ui.heading(tr(language, "Equalization"));
+        ui.label(format!(
+            "{} {} {}",
+            self.eq_band_count,
+            tr(language, "bands"),
+            tr(language, "equalizer controls")
+        ));
         let mut controls_changed = ui
-            .checkbox(&mut self.eq_enabled, "Enable equalizer")
+            .checkbox(&mut self.eq_enabled, tr(language, "Enable equalizer"))
             .changed();
         egui::ComboBox::from_id_salt("eq_band_count")
-            .selected_text(format!("{} bands", self.eq_band_count))
+            .selected_text(format!("{} {}", self.eq_band_count, tr(language, "bands")))
             .show_ui(ui, |ui| {
                 for count in EQ_BAND_COUNTS {
                     if ui
-                        .selectable_value(&mut self.eq_band_count, count, format!("{count} bands"))
+                        .selectable_value(
+                            &mut self.eq_band_count,
+                            count,
+                            format!("{count} {}", tr(language, "bands")),
+                        )
                         .clicked()
                     {
                         self.eq_bands = remap_eq_gains(&self.eq_bands, count);
@@ -2319,11 +3117,11 @@ impl MusicApp {
             });
         let presets = ["Custom", "Flat", "Bass boost", "Treble boost", "Vocal"];
         egui::ComboBox::from_id_salt("eq_preset")
-            .selected_text(presets[self.eq_preset.min(presets.len() - 1)])
+            .selected_text(tr(language, presets[self.eq_preset.min(presets.len() - 1)]))
             .show_ui(ui, |ui| {
                 for (index, preset) in presets.iter().enumerate() {
                     if ui
-                        .selectable_value(&mut self.eq_preset, index, *preset)
+                        .selectable_value(&mut self.eq_preset, index, tr(language, preset))
                         .clicked()
                     {
                         controls_changed = true;
@@ -2363,13 +3161,20 @@ impl MusicApp {
             self.save();
         }
         ui.separator();
-        ui.label("Frequency range: 60 Hz–12 kHz for 5 bands; 30 Hz–18 kHz for 8 bands; 20 Hz–20 kHz for 12–31 bands.");
-        ui.label("Equalizer changes apply immediately during playback.");
+        ui.label(tr(
+            language,
+            "Frequency range: 60 Hz–12 kHz for 5 bands; 30 Hz–18 kHz for 8 bands; 20 Hz–20 kHz for 12–31 bands.",
+        ));
+        ui.label(tr(
+            language,
+            "Equalizer changes apply immediately during playback.",
+        ));
     }
 
     fn render_now_playing_cover(&mut self, ui: &mut egui::Ui) {
+        let language = self.data.language;
         ui.vertical_centered(|ui| {
-            ui.heading("Now Playing");
+            ui.heading(tr(language, "Now Playing"));
             ui.add_space(12.0);
             let artwork_path = self
                 .queue_index
@@ -2382,7 +3187,7 @@ impl MusicApp {
                 })
                 .and_then(|track| track.artwork_path.clone());
             let title = if self.current_title.is_empty() {
-                "Nothing playing".to_owned()
+                tr(language, "Nothing playing").to_owned()
             } else {
                 self.current_title.clone()
             };
@@ -2416,6 +3221,8 @@ impl eframe::App for MusicApp {
         self.finish_artwork_loads(ctx);
         self.finish_waveform_loads();
         egui::TopBottomPanel::top("navigation").show(ctx, |ui| {
+            let language = self.data.language;
+            let mut selected_language = None;
             ui.horizontal(|ui| {
                 ui.heading(format!("Fugue Jam · v{PROGRAM_VERSION}"));
                 ui.separator();
@@ -2425,34 +3232,61 @@ impl eframe::App for MusicApp {
                     Tab::Playlists,
                     Tab::Equalization,
                 ] {
-                    if ui.selectable_label(self.tab == tab, tab.title()).clicked() {
+                    if ui
+                        .selectable_label(self.tab == tab, tab.title(language))
+                        .clicked()
+                    {
                         self.tab = tab;
                     }
                 }
+                ui.menu_button(tr(language, "Language"), |ui| {
+                    for option in Language::ALL {
+                        if ui
+                            .selectable_label(language == option, option.native_name())
+                            .clicked()
+                        {
+                            selected_language = Some(option);
+                            ui.close_menu();
+                        }
+                    }
+                });
             });
+            if let Some(language) = selected_language {
+                self.data.language = language;
+                self.save();
+            }
         });
         egui::TopBottomPanel::bottom("player_controls").show(ctx, |ui| {
+            let language = self.data.language;
             ui.horizontal(|ui| {
-                if ui.button("⏮").on_hover_text("Previous track").clicked() {
+                if ui
+                    .button("⏮")
+                    .on_hover_text(tr(language, "Previous track"))
+                    .clicked()
+                {
                     self.previous_track();
                 }
                 let can_resume = self.paused || self.sink.is_none();
                 if ui
                     .button(if can_resume { "▶" } else { "⏸" })
-                    .on_hover_text(if can_resume { "Play" } else { "Pause" })
+                    .on_hover_text(tr(language, if can_resume { "Play" } else { "Pause" }))
                     .clicked()
                 {
                     self.play_pause();
                 }
-                if ui.button("⏹").on_hover_text("Stop").clicked() {
+                if ui.button("⏹").on_hover_text(tr(language, "Stop")).clicked() {
                     self.stop_button();
                 }
-                if ui.button("⏭").on_hover_text("Next track").clicked() {
+                if ui
+                    .button("⏭")
+                    .on_hover_text(tr(language, "Next track"))
+                    .clicked()
+                {
                     self.next_track();
                 }
                 ui.separator();
                 ui.label(if self.current_title.is_empty() {
-                    "Nothing playing".to_owned()
+                    tr(language, "Nothing playing").to_owned()
                 } else {
                     self.current_title.clone()
                 });
@@ -2480,9 +3314,13 @@ impl eframe::App for MusicApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add(egui::ProgressBar::new(fraction).desired_width(210.0).text(
                             if total == 0 {
-                                "Finding files…".to_owned()
+                                if task.smart_playlist.is_some() {
+                                    tr(language, "Scanning library for smart playlist…").to_owned()
+                                } else {
+                                    tr(language, "Finding files…").to_owned()
+                                }
                             } else {
-                                format!("{progress}/{total} files")
+                                format!("{progress}/{total} {}", tr(language, "files"))
                             },
                         ));
                     });
@@ -2492,6 +3330,7 @@ impl eframe::App for MusicApp {
         egui::TopBottomPanel::bottom("track_timeline")
             .exact_height((ctx.screen_rect().height() * 0.10).clamp(56.0, 128.0))
             .show(ctx, |ui| {
+                let language = self.data.language;
                 let (rect, response) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), ui.available_height()),
                     egui::Sense::click(),
@@ -2545,7 +3384,7 @@ impl eframe::App for MusicApp {
                 let label = format!(
                     "{}  {} / {}",
                     if self.current_title.is_empty() {
-                        "Nothing playing"
+                        tr(language, "Nothing playing")
                     } else {
                         &self.current_title
                     },
@@ -2690,6 +3529,71 @@ fn is_in_scan_scope(path: &Path, folder: &Path, recursive: bool) -> bool {
     path.starts_with(folder) && (recursive || path.parent() == Some(folder))
 }
 
+fn find_moved_track_paths(
+    tracks: &[Track],
+    missing_paths: &HashSet<PathBuf>,
+    added_paths: &HashSet<PathBuf>,
+) -> HashMap<PathBuf, PathBuf> {
+    let mut missing_tracks: Vec<&Track> = tracks
+        .iter()
+        .filter(|track| missing_paths.contains(&track.path))
+        .collect();
+    missing_tracks.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut added_tracks: Vec<&Track> = tracks
+        .iter()
+        .filter(|track| added_paths.contains(&track.path) && !missing_paths.contains(&track.path))
+        .collect();
+    added_tracks.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut used_added_paths = HashSet::new();
+    let mut replacements = HashMap::new();
+    for missing in missing_tracks {
+        if let Some(added) = added_tracks.iter().find(|added| {
+            !used_added_paths.contains(&added.path) && same_track_identity(missing, added)
+        }) {
+            used_added_paths.insert(added.path.clone());
+            replacements.insert(missing.path.clone(), added.path.clone());
+        }
+    }
+    replacements
+}
+
+fn same_track_identity(left: &Track, right: &Track) -> bool {
+    if left.duration_secs.is_none() || left.duration_secs != right.duration_secs {
+        return false;
+    }
+    let normalize = |value: &str| value.trim().to_lowercase();
+    let artist = |track: &Track| {
+        if track.album_artist.trim().is_empty() {
+            normalize(&track.artist)
+        } else {
+            normalize(&track.album_artist)
+        }
+    };
+    let left_artist = artist(left);
+    let right_artist = artist(right);
+    let left_album = normalize(&left.album);
+    let right_album = normalize(&right.album);
+    if left_artist.is_empty()
+        || left_artist != right_artist
+        || left_album.is_empty()
+        || left_album != right_album
+    {
+        return false;
+    }
+
+    if let (Some(left_number), Some(right_number)) = (&left.track_number, &right.track_number)
+        && left_number == right_number
+    {
+        return left.disc_number.is_none()
+            || right.disc_number.is_none()
+            || left.disc_number == right.disc_number;
+    }
+
+    !left.title.trim().is_empty() && normalize(&left.title) == normalize(&right.title)
+}
+
 fn track_group_value(track: &Track, organize_by: &str) -> String {
     match organize_by {
         "Genre" => track.genre.clone(),
@@ -2804,6 +3708,70 @@ fn collect_audio_files(
     Ok(())
 }
 
+fn load_playlist_rows(
+    playlist: &Playlist,
+    tracks: &[Track],
+    sender: &Sender<PlaylistLoadMessage>,
+    ctx: &egui::Context,
+) {
+    let track_by_path: HashMap<&Path, &Track> = tracks
+        .iter()
+        .map(|track| (track.path.as_path(), track))
+        .collect();
+    let mut batch = Vec::with_capacity(64);
+    let send_batch = |batch: &mut Vec<PlaylistTrackRow>| {
+        if batch.is_empty() {
+            return true;
+        }
+        let rows = std::mem::replace(batch, Vec::with_capacity(64));
+        if sender.send(PlaylistLoadMessage::Batch(rows)).is_err() {
+            return false;
+        }
+        ctx.request_repaint();
+        true
+    };
+
+    match &playlist.smart {
+        Some(query) => {
+            for track in tracks.iter().filter(|track| query.matches(track)) {
+                batch.push(PlaylistTrackRow {
+                    path: track.path.clone(),
+                    title: track.display_title().to_owned(),
+                });
+                if batch.len() == 64 && !send_batch(&mut batch) {
+                    return;
+                }
+            }
+        }
+        None => {
+            for path in &playlist.tracks {
+                let title = track_by_path
+                    .get(path.as_path())
+                    .map(|track| track.display_title().to_owned())
+                    .unwrap_or_else(|| {
+                        path.file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| path.display().to_string())
+                    });
+                batch.push(PlaylistTrackRow {
+                    path: path.clone(),
+                    title,
+                });
+                if batch.len() == 64 && !send_batch(&mut batch) {
+                    return;
+                }
+            }
+        }
+    }
+
+    if !send_batch(&mut batch) {
+        return;
+    }
+    let _ = sender.send(PlaylistLoadMessage::Finished(Ok(())));
+    ctx.request_repaint();
+}
+
 fn scan_folder(
     folder: &Path,
     recursive: bool,
@@ -2812,8 +3780,30 @@ fn scan_folder(
     total: &AtomicUsize,
     sender: &Sender<ScanMessage>,
 ) -> Result<(), String> {
+    let folders = [folder.to_path_buf()];
+    scan_folders(&folders, recursive, artwork_dir, progress, total, sender)
+}
+
+fn scan_folders(
+    folders: &[PathBuf],
+    recursive: bool,
+    artwork_dir: &Path,
+    progress: &AtomicUsize,
+    total: &AtomicUsize,
+    sender: &Sender<ScanMessage>,
+) -> Result<(), String> {
     let mut files = Vec::new();
-    collect_audio_files(folder, recursive, &mut files).map_err(|error| error.to_string())?;
+    let mut seen_files = HashSet::new();
+    for folder in folders {
+        let mut folder_files = Vec::new();
+        collect_audio_files(folder, recursive, &mut folder_files)
+            .map_err(|error| format!("{}: {error}", folder.display()))?;
+        for path in folder_files {
+            if seen_files.insert(path.clone()) {
+                files.push(path);
+            }
+        }
+    }
     files.sort();
     total.store(files.len(), Ordering::Relaxed);
     sender
@@ -3056,15 +4046,22 @@ fn install_multilingual_font_fallback(ctx: &egui::Context) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::{
-        EQ_BAND_COUNTS, LibraryData, LibraryView, MAX_WAVEFORM_PEAKS, QueueDisplayField,
-        QueueEntry, Track, available_library_view, collect_audio_files, decode_artwork,
-        eq_frequencies, first_tag_value_from_tags, gallery_items, is_in_scan_scope,
-        is_supported_audio_file, reduce_waveform_peaks, remap_eq_gains,
-        stopped_queue_restart_target, track_group_value,
+        EQ_BAND_COUNTS, LibraryData, LibraryView, MAX_WAVEFORM_PEAKS, Playlist,
+        PlaylistLoadMessage, QueueDisplayField, QueueEntry, SmartCondition, SmartField, SmartMatch,
+        SmartOperator, SmartPlaylistQuery, Track, available_library_view, collect_audio_files,
+        decode_artwork, eq_frequencies, find_moved_track_paths, first_tag_value_from_tags,
+        gallery_items, is_in_scan_scope, is_supported_audio_file, load_playlist_rows,
+        reduce_waveform_peaks, remap_eq_gains, scan_folders, stopped_queue_restart_target,
+        track_group_value,
     };
+    use crate::localization::Language;
+    use eframe::egui;
     use std::{
+        collections::{HashMap, HashSet},
         fs,
-        path::Path,
+        path::{Path, PathBuf},
+        sync::atomic::AtomicUsize,
+        sync::mpsc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -3181,6 +4178,261 @@ mod tests {
     }
 
     #[test]
+    fn playlist_rows_load_in_order_and_are_sent_in_batches() {
+        let tracks: Vec<Track> = (0..130)
+            .map(|index| Track {
+                path: Path::new("music").join(format!("{index}.flac")),
+                title: format!("Track {index}"),
+                ..Track::default()
+            })
+            .collect();
+        let playlist = Playlist {
+            name: "Test".to_owned(),
+            tracks: tracks
+                .iter()
+                .rev()
+                .map(|track| track.path.clone())
+                .collect(),
+            smart: None,
+        };
+        let (sender, receiver) = mpsc::channel();
+        load_playlist_rows(&playlist, &tracks, &sender, &egui::Context::default());
+
+        let mut rows = Vec::new();
+        let mut batch_count = 0;
+        while let Ok(message) = receiver.recv() {
+            match message {
+                PlaylistLoadMessage::Batch(batch) => {
+                    batch_count += 1;
+                    rows.extend(batch);
+                }
+                PlaylistLoadMessage::Finished(result) => {
+                    assert!(result.is_ok());
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(batch_count, 3);
+        assert_eq!(rows.len(), 130);
+        assert_eq!(rows[0].title, "Track 129");
+        assert_eq!(rows[129].title, "Track 0");
+    }
+
+    #[test]
+    fn scan_matches_a_new_path_to_a_missing_track_without_matching_other_tracks() {
+        let old_track = Track {
+            path: Path::new("/music/Old Name.flac").to_path_buf(),
+            title: "Old Name".to_owned(),
+            album_artist: "Example Artist".to_owned(),
+            album: "Example Album".to_owned(),
+            track_number: Some("03".to_owned()),
+            duration_secs: Some(215),
+            ..Track::default()
+        };
+        let moved_track = Track {
+            path: Path::new("/music/renamed/03.flac").to_path_buf(),
+            title: "New Title".to_owned(),
+            album_artist: "Example Artist".to_owned(),
+            album: "Example Album".to_owned(),
+            track_number: Some("03".to_owned()),
+            duration_secs: Some(215),
+            ..Track::default()
+        };
+        let unrelated_track = Track {
+            path: Path::new("/music/renamed/04.flac").to_path_buf(),
+            title: "Other Song".to_owned(),
+            album_artist: "Different Artist".to_owned(),
+            album: "Different Album".to_owned(),
+            track_number: Some("04".to_owned()),
+            duration_secs: Some(215),
+            ..Track::default()
+        };
+        let tracks = vec![old_track.clone(), moved_track.clone(), unrelated_track];
+        let missing = HashSet::from([old_track.path.clone()]);
+        let added = HashSet::from([
+            moved_track.path.clone(),
+            PathBuf::from("/music/renamed/04.flac"),
+        ]);
+
+        assert_eq!(
+            find_moved_track_paths(&tracks, &missing, &added),
+            HashMap::from([(old_track.path, moved_track.path)])
+        );
+    }
+
+    #[test]
+    fn smart_playlist_conditions_support_and_or_precedence_and_parentheses() {
+        let track = Track {
+            album_artist: "Example Artist".to_owned(),
+            genre: "Rock".to_owned(),
+            year: Some(1995),
+            ..Track::default()
+        };
+        let grouped = SmartPlaylistQuery {
+            conditions: vec![
+                SmartCondition {
+                    field: SmartField::AlbumArtist,
+                    query: "example".to_owned(),
+                    open_parentheses: 1,
+                    ..SmartCondition::default()
+                },
+                SmartCondition {
+                    field: SmartField::Genre,
+                    query: "rock".to_owned(),
+                    close_parentheses: 1,
+                    ..SmartCondition::default()
+                },
+                SmartCondition {
+                    field: SmartField::Year,
+                    query: "1990".to_owned(),
+                    ..SmartCondition::default()
+                },
+            ],
+            operators: vec![SmartOperator::And, SmartOperator::Or],
+        };
+        assert!(grouped.is_valid());
+        assert!(grouped.matches(&track));
+
+        let grouped_or = SmartPlaylistQuery {
+            conditions: vec![
+                SmartCondition {
+                    field: SmartField::AlbumArtist,
+                    query: "missing".to_owned(),
+                    ..SmartCondition::default()
+                },
+                SmartCondition {
+                    field: SmartField::Genre,
+                    query: "rock".to_owned(),
+                    open_parentheses: 1,
+                    ..SmartCondition::default()
+                },
+                SmartCondition {
+                    field: SmartField::Year,
+                    query: "1995".to_owned(),
+                    close_parentheses: 1,
+                    ..SmartCondition::default()
+                },
+            ],
+            operators: vec![SmartOperator::And, SmartOperator::Or],
+        };
+        assert!(!grouped_or.matches(&track));
+
+        let precedence = SmartPlaylistQuery {
+            conditions: vec![
+                SmartCondition {
+                    field: SmartField::AlbumArtist,
+                    query: "missing".to_owned(),
+                    ..SmartCondition::default()
+                },
+                SmartCondition {
+                    field: SmartField::Genre,
+                    query: "rock".to_owned(),
+                    ..SmartCondition::default()
+                },
+                SmartCondition {
+                    field: SmartField::Year,
+                    query: "1995".to_owned(),
+                    ..SmartCondition::default()
+                },
+            ],
+            operators: vec![SmartOperator::Or, SmartOperator::And],
+        };
+        assert!(precedence.matches(&track));
+    }
+
+    #[test]
+    fn smart_playlist_rejects_empty_conditions_and_unbalanced_parentheses() {
+        let mut query = SmartPlaylistQuery {
+            conditions: vec![SmartCondition {
+                field: SmartField::Genre,
+                query: "rock".to_owned(),
+                open_parentheses: 1,
+                ..SmartCondition::default()
+            }],
+            operators: Vec::new(),
+        };
+        assert!(!query.is_valid());
+        assert!(!query.matches(&Track::default()));
+        query.conditions[0].close_parentheses = 1;
+        assert!(query.is_valid());
+        query.conditions[0].query.clear();
+        assert!(!query.is_valid());
+    }
+
+    #[test]
+    fn smart_match_supports_contains_and_does_not_contain() {
+        assert!(SmartMatch::Contains.matches("Classic Rock", "rock"));
+        assert!(!SmartMatch::DoesNotContain.matches("Classic Rock", "rock"));
+        assert!(SmartMatch::DoesNotContain.matches("Jazz", "rock"));
+        assert_eq!(SmartMatch::default(), SmartMatch::Contains);
+    }
+
+    #[test]
+    fn smart_playlist_scan_reports_progress_across_library_folders() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "fugue-jam-smart-scan-{}-{nonce}",
+            std::process::id()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        let artwork = root.join("artwork");
+        fs::create_dir_all(&first).expect("create first library folder");
+        fs::create_dir_all(&second).expect("create second library folder");
+        fs::write(first.join("one.flac"), []).expect("create first audio file");
+        fs::write(second.join("two.ogg"), []).expect("create second audio file");
+
+        let (sender, receiver) = mpsc::channel();
+        let progress = AtomicUsize::new(0);
+        let total = AtomicUsize::new(0);
+        scan_folders(&[first, second], true, &artwork, &progress, &total, &sender)
+            .expect("scan all library folders");
+        assert_eq!(progress.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(matches!(
+            receiver.recv().expect("receive total"),
+            super::ScanMessage::Total(2)
+        ));
+        assert!(matches!(
+            receiver.recv().expect("receive first scanned track"),
+            super::ScanMessage::Track(_)
+        ));
+        assert!(matches!(
+            receiver.recv().expect("receive second scanned track"),
+            super::ScanMessage::Track(_)
+        ));
+
+        fs::remove_dir_all(root).expect("remove smart-playlist scan folders");
+    }
+
+    #[test]
+    fn legacy_smart_playlist_query_migrates_to_single_condition() {
+        let playlist: super::Playlist =
+            serde_json::from_str(r#"{"name":"Rock","tracks":[],"smart":["Genre","rock"]}"#)
+                .expect("load legacy smart playlist");
+        let query = playlist.smart.expect("migrate smart query");
+        assert_eq!(query.conditions.len(), 1);
+        assert_eq!(query.conditions[0].query, "rock");
+        assert!(query.matches(&Track {
+            genre: "Classic Rock".to_owned(),
+            ..Track::default()
+        }));
+
+        let earlier_query: super::Playlist = serde_json::from_str(
+            r#"{"name":"Jazz","tracks":[],"smart":{"conditions":[{"field":"Genre","query":"jazz","open_parentheses":0,"close_parentheses":0}],"operators":[]}}"#,
+        )
+        .expect("load smart playlist without comparison mode");
+        assert_eq!(
+            earlier_query.smart.expect("load previous query").conditions[0].comparison,
+            SmartMatch::Contains
+        );
+    }
+
+    #[test]
     fn scan_scope_respects_recursive_setting() {
         let folder = Path::new("/music");
         assert!(is_in_scan_scope(
@@ -3210,6 +4462,7 @@ mod tests {
         let existing_library = r#"{"folders":[],"tracks":[],"playlists":[]}"#;
         let mut library: LibraryData =
             serde_json::from_str(existing_library).expect("load previous library format");
+        assert_eq!(library.language, Language::English);
         assert!(library.queue.is_empty());
         assert_eq!(library.queue_display_fields, vec![QueueDisplayField::Title]);
 
@@ -3225,9 +4478,11 @@ mod tests {
             title: "Tagged title".to_owned(),
             ..QueueEntry::default()
         });
+        library.language = Language::French;
         let saved = serde_json::to_string(&library).expect("serialize library and queue");
         let restored: LibraryData =
             serde_json::from_str(&saved).expect("restore serialized library");
+        assert_eq!(restored.language, Language::French);
         assert_eq!(restored.queue[0].path, library.queue[0].path);
         assert_eq!(restored.queue[0].title, "Tagged title");
 
@@ -3284,6 +4539,50 @@ mod tests {
         );
         assert!(!QueueDisplayField::ALL.contains(&QueueDisplayField::Composer));
         assert!(!QueueDisplayField::ALL.contains(&QueueDisplayField::Bpm));
+    }
+
+    #[test]
+    fn queue_entries_keep_only_selected_track_metadata() {
+        let track = Track {
+            path: Path::new("/music/song.flac").to_path_buf(),
+            title: "Song".to_owned(),
+            artist: "Artist".to_owned(),
+            album_artist: "Album Artist".to_owned(),
+            album: "Album".to_owned(),
+            genre: "Genre".to_owned(),
+            year: Some(2024),
+            track_number: Some("7".to_owned()),
+            disc_number: Some("2".to_owned()),
+            duration_secs: Some(184),
+            ..Track::default()
+        };
+        let fields = [QueueDisplayField::Album, QueueDisplayField::TrackLength];
+        let mut entry = super::QueueEntry::from_track(&track, &fields);
+        assert_eq!(entry.path, track.path);
+        assert_eq!(entry.title, "Song");
+        assert_eq!(entry.album, "Album");
+        assert_eq!(entry.duration_secs, Some(184));
+        assert!(entry.artist.is_empty());
+        assert!(entry.album_artist.is_empty());
+        assert!(entry.genre.is_empty());
+        assert_eq!(entry.year, None);
+        assert_eq!(entry.track_number, None);
+        assert_eq!(entry.disc_number, None);
+
+        entry.update_fields(
+            &track,
+            &[QueueDisplayField::Artist, QueueDisplayField::Year],
+        );
+        assert_eq!(entry.artist, "Artist");
+        assert_eq!(entry.year, Some(2024));
+        assert!(entry.album.is_empty());
+        assert_eq!(entry.duration_secs, None);
+
+        entry.album = "Stale album".to_owned();
+        entry.retain_fields(&[QueueDisplayField::Title]);
+        assert!(entry.album.is_empty());
+        assert!(entry.artist.is_empty());
+        assert_eq!(entry.title, "Song");
     }
 
     #[test]

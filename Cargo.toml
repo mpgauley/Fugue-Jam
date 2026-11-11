@@ -1,6 +1,6 @@
 [package]
 name = "fugue-jam"
-version = "17.0.0"
+version = "25.0.0"
 edition = "2024"
 description = "A local-first Linux music player"
 license = "Apache-2.0"
@@ -28,5 +28,5 @@ lofty = "0.22"
 rand = "0.9"
 rfd = "0.15"
 rodio = { version = "0.20", features = ["symphonia-all", "symphonia-aiff", "symphonia-alac"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
